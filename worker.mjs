@@ -75,6 +75,11 @@ function laddersFrom(book) {
   return out;
 }
 
+// ONE definition, used by both the tick and the restart seed. If these two ever
+// hashed differently the seed would look like a change and restate everything,
+// which is the exact bug it exists to prevent.
+const ladderKey = (L) => crypto.createHash('sha1').update(JSON.stringify([L.b, L.a])).digest('hex');
+
 function topOfBook(book) {
   const m = new Map();
   for (const o of book.values()) {
@@ -94,19 +99,35 @@ const appendLines = (dir, d, lines) => {
   fs.appendFileSync(path.join(dir, `${d}.ndjson`), lines.join('\n') + '\n');
 };
 
-function saveState(ts, book) {
+function saveState(ts, book, g) {
   fs.mkdirSync(path.dirname(STATE), { recursive: true });
   const o = [...book].map(([id, x]) => [id, x.t, x.p, x.v, x.b ? 1 : 0, x.e]);
   const tmp = STATE + '.tmp';
-  fs.writeFileSync(tmp, zlib.gzipSync(JSON.stringify({ ts, o }), { level: 6 }));
+  // `gen` rides along with the book so a restart can ask "is this still the
+  // generation I already have?" in ONE request instead of re-reading 410 pages
+  // to rediscover a book it just loaded off the volume.
+  fs.writeFileSync(tmp, zlib.gzipSync(JSON.stringify({ ts, gen: g || null, o }), { level: 6 }));
   fs.renameSync(tmp, STATE);   // atomic: a crash mid-write can't corrupt the state
 }
 function loadState() {
   if (!fs.existsSync(STATE)) return null;
   try {
     const j = JSON.parse(zlib.gunzipSync(fs.readFileSync(STATE)).toString('utf8'));
-    return { ts: j.ts, book: new Map(j.o.map((r) => [r[0], { t: r[1], p: r[2], v: r[3], b: !!r[4], e: r[5] }])) };
+    return {
+      ts: j.ts,
+      gen: j.gen || null,   // absent in state files written before this existed
+      book: new Map(j.o.map((r) => [r[0], { t: r[1], p: r[2], v: r[3], b: !!r[4], e: r[5] }])),
+    };
   } catch (e) { log('state unreadable, cold starting:', e.message); return null; }
+}
+
+// A restart used to restate every ladder and every top-of-book row — 18,806 of
+// each, every time Railway so much as redeployed — because these delta caches
+// live only in memory. The resumed book IS what was last written, so rehashing
+// it puts the delta encoding back exactly where it left off.
+function seedDeltaCaches(book) {
+  for (const L of laddersFrom(book)) ladderHash.set(L.i, ladderKey(L));
+  for (const [t, v] of topOfBook(book)) tobLast.set(t, `${v.b ?? ''},${v.a ?? ''}`);
 }
 
 function maintain(today) {
@@ -177,7 +198,7 @@ async function tick() {
   // --- depth (only what moved)
   const drows = [];
   for (const L of laddersFrom(book)) {
-    const h = crypto.createHash('sha1').update(JSON.stringify([L.b, L.a])).digest('hex');
+    const h = ladderKey(L);
     if (ladderHash.get(L.i) === h) continue;
     ladderHash.set(L.i, h);
     drows.push(JSON.stringify({ t: iso, i: L.i, b: L.b, a: L.a }));
@@ -202,7 +223,7 @@ async function tick() {
   }
 
   prev = { ts: iso, book };
-  saveState(iso, book);
+  saveState(iso, book, gen);
   const { zipped, pruned } = maintain(d);
 
   // The tape's honesty lives entirely in the exact/probable split.
@@ -270,7 +291,10 @@ async function loop() {
     nextDelayMs = INTERVAL;
   } finally {
     running = false;
-    if (!stopping) timer = setTimeout(loop, nextDelayMs);
+    // Every write in a tick is synchronous, so once tick() returns the volume is
+    // already consistent — no reason to sit out the rest of the shutdown grace.
+    if (stopping) { log('tick finished, exiting'); process.exit(0); }
+    timer = setTimeout(loop, nextDelayMs);
   }
 }
 
@@ -307,7 +331,7 @@ http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ...stats, stale, rssMB: +(process.memoryUsage().rss / 1e6).toFixed(0),
                            intervalSec: INTERVAL / 1000, universe: universe ? universe.size : 'all' }, null, 2));
-}).listen(PORT, () => log(`health on :${PORT} · interval ${INTERVAL / 1000}s · data ${ROOT}`));
+}).listen(PORT, () => log(`health on :${PORT} · schedule from ESI Expires (fallback ${INTERVAL / 1000}s) · data ${ROOT}`));
 
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => {
@@ -320,5 +344,12 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 
 loadUniverse();
 prev = loadState();
-log(prev ? `resumed from state at ${prev.ts} (${prev.book.size} orders)` : 'cold start — first tick produces no tape');
+if (prev) {
+  gen = prev.gen;              // lets the first scan be a 1-page probe
+  seedDeltaCaches(prev.book);  // stops the first tick restating every ladder
+}
+log(prev
+  ? `resumed from state at ${prev.ts} (${prev.book.size} orders)` +
+    (gen ? ` · gen ${gen.lastModified}` : ' · no stored generation, first scan will be full')
+  : 'cold start — first tick produces no tape');
 await loop();   // loop() reschedules itself off ESI's Expires header

@@ -17,7 +17,7 @@ cd eve-forge-collector
 npm test
 ```
 
-All five suites must say `all checks passed` (75 checks). If they don't, stop and tell me — nothing
+All five suites must say `all checks passed` (85 checks). If they don't, stop and tell me — nothing
 below is worth doing against a broken collector.
 
 ```bash
@@ -244,6 +244,7 @@ You can always tighten it later; the data formats don't change.
 | deploy fails healthcheck, logs show `/data` errors | no volume | Part 3b |
 | `ticks` stuck at 1, `lastError` mentions pages | ESI refusing or rate-limiting | check `ESI_UA` is set; the worker backs off on its own |
 | every restart logs `cold start` | volume not mounted, or mounted at the wrong path | mount path must be exactly `/data` |
+| restart logs `no stored generation` every time | state written by an older build, or the volume isn't persisting | harmless once; persistent means check the volume |
 | `fillsLastTick` always 0 | still cold-starting each tick — see above | same |
 | Actions runs fail at the push step | workflow permissions | Part 2 step 1 |
 | `rssMB` near the plan ceiling | book held twice during the diff | ask me for the typed-array rewrite |

@@ -9,8 +9,8 @@ Three collectors over one data source, plus the tools to read them back.
 | 3 | `tape.mjs` | 5 min | persistent | inferred fills — price, size, side — forever |
 
 `universe.mjs` (weekly) decides who is liquid enough for tiers 2 and 3.
-All three make the same ~300-request pass over `/markets/10000002/orders/`; they
-differ only in what they keep.
+All three make the same pass over `/markets/10000002/orders/` — 410-411 pages as
+of September 2026 — and differ only in what they keep.
 
 ## Running it on Railway
 
@@ -29,9 +29,11 @@ can resume.
 3. Set `ESI_UA` to a contact string. Optionally `INTERVAL_SEC` (fallback only —
    see below), `TICK_PAD_SEC` (default 5) and `RETAIN_DAYS` (default 90, depth
    only — fills are kept forever).
-4. `GET /health` returns 200 while ticks are landing, 503 if the last one is
-   older than 3 intervals. `GET /status` returns tick count, order count, fills
-   on the last tick, and **`rssMB`** — watch that one.
+4. `GET /health` returns 200 while **scans** are landing, 503 if the last one is
+   older than 3 intervals. Scans, not ticks: a run of generations where nothing
+   changed is a healthy worker being cheap, and judging it on ticks would kill a
+   process that is working correctly. `GET /status` adds tick and skip counts,
+   order count, the fill breakdown, and **`rssMB`**.
 
 ### The worker follows ESI's cache, not a stopwatch
 
@@ -113,11 +115,33 @@ saying **why**. That distinction is the whole ball game:
   trade definitely happened; only the price is in doubt.
 - `front` is a real inference from a real surviving touch.
 - `empty` is a **default, not a deduction**. Nothing survives on that side, so
-  there is nothing to compare against. A plain cancel on a thin item — and most
-  of 18,808 items are one trader's lone order — lands here every single time and
-  is indistinguishable from a sweep. If `empty` carries a large share of the ISK,
-  the tape is inflated and the test needs tightening. **Never treat the tape as ground
-truth without running `tools/validate-tape.mjs`** — it sums a day's inferred
+  there is nothing to compare against, and a plain cancel is indistinguishable
+  from a sweep.
+
+**Measured at Jita on 2026-09-15, over 734 fills in one generation:**
+
+| | fills | ISK | share |
+|---|---|---|---|
+| `exact` | 573 | 12.48B | 54.1% |
+| `amb` | 5 | 0.01B | 0.04% |
+| `front` | 156 | 10.57B | 45.8% |
+| `empty` | **0** | **0.00B** | **0%** |
+
+`empty` never fires here, and the reason is specific to this station. The worry
+was that most of 18,806 items are one trader's lone order, so a cancel would
+empty the side and be booked as a sweep. That is true of a quiet regional market
+and **false at Jita 4-4**, which is where everyone parks: for `empty` to fire,
+every order on that side of that item must vanish inside one generation. Do not
+carry this result to another region without re-measuring.
+
+So the tape is roughly half observed and half inferred-on-evidence. What `front`
+still cannot separate is "sold from the front" versus "cancelled at the front".
+The reason to trust it is economic: cancelling forfeits the whole broker fee,
+while repricing preserves `order_id` and bills a discounted relist — so traders
+reprice, and the data agrees (189 reprices against 4 visible cancels in that
+same generation).
+
+**None of this replaces `tools/validate-tape.mjs`** — it sums a day's inferred
 fills per type and divides by the volume ESI actually reports. Near 1.0 is
 healthy; systematically under means fills are being lost, over means cancels are
 being read as fills. Run it weekly.
@@ -133,7 +157,8 @@ queue position.
 data/YYYY-MM/YYYY-MM-DD.csv(.gz)   top of book, every item, forever
 depth/YYYY-MM-DD.ndjson(.gz)       25 ladder levels a side, rolling RETAIN_DAYS
 fills/YYYY-MM-DD.ndjson(.gz)       the inferred tape, forever
-state/book.json.gz                 last snapshot, so a restart can resume
+state/book.json.gz                 last snapshot + generation stamp, so a
+                                   restart resumes without re-reading the book
 universe.json                      which types get depth and tape
 ```
 
@@ -170,7 +195,7 @@ node tools/validate-tape.mjs 2026-09-22                    # is the tape honest?
 npm test
 ```
 
-75 checks across five suites (9 + 13 + 23 + 18 + 12), all against a fake
+85 checks across five suites (9 + 13 + 23 + 18 + 22), all against a fake
 in-process ESI — no network.
 Pagination via `x-pages`, best-bid/ask reduction, the Jita filter, ladder merging
 and the level cap, delta encoding, retention and gzip, and the full fill-inference
@@ -178,9 +203,11 @@ table including a reconstruction of a real 868-unit sweep.
 
 `test-gen.mjs` covers cache-generation detection and the scheduler's clamps,
 including a server whose clock disagrees with the client's. `test-worker.mjs`
-boots the **real worker** against a fake ESI and drives it through cold start,
-an unchanged generation, a generation that moved, and a restart that has to
-resume from the volume instead of cold starting.
+boots the **real worker** against a fake ESI that serves one order per page — so
+"probed a page" and "read the whole book" are different request counts — and
+drives it through cold start, an unchanged generation, a generation that moved,
+a restart that resumes from the volume and reuses the stored generation without
+restating every ladder, and a state file written before `gen` existed.
 
 ## Seeded history
 
