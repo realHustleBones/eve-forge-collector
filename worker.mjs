@@ -42,7 +42,9 @@ let universe = null;
 let ladderHash = new Map();
 let tobLast = new Map();
 const stats = { started: new Date().toISOString(), ticks: 0, lastTick: null, lastError: null,
-                orders: 0, pages: 0, fillsLastTick: 0, unitsLastTick: 0, iskLastTick: 0, fillsToday: 0, today: null };
+                orders: 0, pages: 0, fillsLastTick: 0, unitsLastTick: 0, iskLastTick: 0, fillsToday: 0, today: null,
+                exactLastTick: null, probableLastTick: null, topFillLastTick: null,
+                cancelsLastTick: 0, repricesLastTick: 0, expiresLastTick: 0 };
 
 // ---------------------------------------------------------------- ladders
 
@@ -138,9 +140,10 @@ async function tick() {
   stats.orders = book.size; stats.pages = pages;
 
   // --- tape
-  let fills = [];
+  let fills = [], ev = [];
   if (prev) {
-    fills = diff(prev.book, book, Date.parse(iso)).filter((e) => e.k === 'fill');
+    ev = diff(prev.book, book, Date.parse(iso));
+    fills = ev.filter((e) => e.k === 'fill');
     appendLines(FILLS, d, fills.map((f) =>
       JSON.stringify({ t: iso, i: f.i, p: f.p, q: f.q, s: f.s, c: f.c })));
   }
@@ -176,13 +179,37 @@ async function tick() {
   saveState(iso, book);
   const { zipped, pruned } = maintain(d);
 
-  const units = fills.reduce((s, f) => s + f.q, 0);
-  const isk = fills.reduce((s, f) => s + f.p * f.q, 0);
+  // The tape's honesty lives entirely in the exact/probable split.
+  //   exact    = volume_remain fell on a surviving order_id. That is an
+  //              OBSERVATION; nothing but a trade can do it.
+  //   probable = the order_id vanished while at or ahead of the surviving
+  //              touch. That is a GUESS. A full fill and a cancel of a
+  //              front-of-book order are literally indistinguishable in the
+  //              data, and this branch resolves the tie toward 'fill'.
+  // So: if probable carries most of the ISK, the tape is mostly inference and
+  // the front-of-queue test is what needs tightening, not the plumbing.
+  const agg = (xs) => xs.reduce((a, f) => (a.n++, a.q += f.q, a.k += f.p * f.q, a), { n: 0, q: 0, k: 0 });
+  const all = agg(fills);
+  const ex = agg(fills.filter((f) => f.c === 'exact'));
+  const pr = agg(fills.filter((f) => f.c === 'probable'));
+  const cnt = (k) => ev.reduce((s, e) => s + (e.k === k ? 1 : 0), 0);
+  // One misclassified whale can carry a whole tick's ISK while the average
+  // hides it, so name the biggest single inferred fill every tick.
+  const top = fills.reduce((bst, f) => (!bst || f.p * f.q > bst.p * bst.q ? f : bst), null);
+  const B = (x) => (x / 1e9).toFixed(2) + 'B';
+
   stats.ticks++; stats.lastTick = iso; stats.lastError = null;
-  stats.fillsLastTick = fills.length; stats.unitsLastTick = units; stats.iskLastTick = isk;
-  stats.fillsToday += fills.length;
-  log(`${pages}p ${book.size} orders · fills ${fills.length} (${units.toLocaleString()}u, ${(isk / 1e9).toFixed(2)}B) ` +
-      `· depth ${drows.length} · tob ${trows.length}` +
+  stats.fillsLastTick = all.n; stats.unitsLastTick = all.q; stats.iskLastTick = all.k;
+  stats.exactLastTick = ex; stats.probableLastTick = pr;
+  stats.cancelsLastTick = cnt('cancel'); stats.repricesLastTick = cnt('reprice'); stats.expiresLastTick = cnt('expire');
+  stats.topFillLastTick = top ? { i: top.i, p: top.p, q: top.q, s: top.s, c: top.c, isk: top.p * top.q } : null;
+  stats.fillsToday += all.n;
+
+  log(`${pages}p ${book.size} orders · fills ${all.n} (${all.q.toLocaleString()}u, ${B(all.k)})` +
+      ` [exact ${ex.n} ${ex.q.toLocaleString()}u ${B(ex.k)} · prob ${pr.n} ${pr.q.toLocaleString()}u ${B(pr.k)}]` +
+      ` · cx ${cnt('cancel')} rp ${cnt('reprice')} xp ${cnt('expire')}` +
+      (top ? ` · top ${top.i} ${top.q.toLocaleString()}@${top.p.toLocaleString()}=${B(top.p * top.q)}${top.c === 'exact' ? '' : '?'}` : '') +
+      ` · depth ${drows.length} · tob ${trows.length}` +
       (zipped ? ` · gz ${zipped}` : '') + (pruned ? ` · pruned ${pruned}` : '') +
       ` · rss ${(process.memoryUsage().rss / 1e6).toFixed(0)}MB · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 }
