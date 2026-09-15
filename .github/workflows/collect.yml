@@ -5,7 +5,7 @@ on:
     # Every hour at :48. Deliberately off the hour — GitHub's scheduler is
     # busiest at :00 and drifts most there. Expect samples to land a few
     # minutes late under load; this is best-effort, not a real-time cron.
-    - cron: '48 * * * *'
+    - cron: '5 * * * *'
   workflow_dispatch: {}
 
 # Never let a slow run overlap the next one — two collectors appending to the
