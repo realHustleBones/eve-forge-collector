@@ -1,0 +1,55 @@
+name: collect
+
+on:
+  schedule:
+    # Every hour at :48. Deliberately off the hour — GitHub's scheduler is
+    # busiest at :00 and drifts most there. Expect samples to land a few
+    # minutes late under load; this is best-effort, not a real-time cron.
+    - cron: '48 * * * *'
+  workflow_dispatch: {}
+
+# Never let a slow run overlap the next one — two collectors appending to the
+# same day file would interleave rows and corrupt the delta state.
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Collect Forge bid/ask
+        env:
+          # ESI asks for a contact in the User-Agent. Set the ESI_UA repo
+          # variable (Settings -> Secrets and variables -> Actions -> Variables).
+          ESI_UA: ${{ vars.ESI_UA || 'eve-forge-collector (github actions)' }}
+        run: node collect.mjs
+
+      - name: Commit
+        run: |
+          set -euo pipefail
+          git config user.name  "forge-collector[bot]"
+          git config user.email "forge-collector[bot]@users.noreply.github.com"
+          git add -A data
+          if git diff --cached --quiet; then
+            echo "no changes"
+            exit 0
+          fi
+          git commit -m "data: $(date -u +%Y-%m-%dT%H:%MZ)"
+          # Another run may have landed while we were scanning; rebase and retry.
+          for i in 1 2 3; do
+            if git push; then exit 0; fi
+            git pull --rebase --autostash
+          done
+          echo "push failed after 3 attempts" >&2
+          exit 1

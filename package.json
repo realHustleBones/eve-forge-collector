@@ -1,0 +1,19 @@
+{
+  "name": "eve-forge-collector",
+  "version": "2.0.0",
+  "description": "Hourly best bid/ask for every item trading at Jita 4-4, collected from public ESI",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node worker.mjs",
+    "collect": "node collect.mjs",
+    "depth": "node depth.mjs",
+    "tape": "node tape.mjs",
+    "universe": "node universe.mjs",
+    "series": "node tools/series.mjs",
+    "test": "node tools/test-collect.mjs && node tools/test-depth.mjs && node tools/test-tape.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
