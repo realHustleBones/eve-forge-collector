@@ -58,16 +58,27 @@ reconstructs fills by differencing the whole order book on `order_id` between
 consecutive snapshots. `order_id` survives a reprice, which is what makes a moved
 order distinguishable from a hit one.
 
-| prev -> now | verdict | confidence |
-|---|---|---|
-| `volume_remain` fell, id present | **fill** at that price, that size | exact |
-| price changed, id present | reprice (no fill) | — |
-| price changed AND volume fell | fill, but the price is ambiguous | probable |
-| id gone, at/ahead of the surviving touch | fill | probable |
-| id gone, behind the touch | cancel | — |
-| id gone, past `issued + duration` | expire | certain |
+| prev -> now | verdict | `c` | `r` |
+|---|---|---|---|
+| `volume_remain` fell, id present | **fill** at that price, that size | exact | — |
+| price changed, id present | reprice (no fill) | — | — |
+| price changed AND volume fell | fill happened, price ambiguous | probable | `amb` |
+| id gone, ahead of a **live** touch | fill | probable | `front` |
+| id gone, **nothing left on that side** | fill, by default | probable | `empty` |
+| id gone, behind the touch | cancel | — | — |
+| id gone, past `issued + duration` | expire | certain | — |
 
-Every fill carries `c: "exact" | "probable"`. **Never treat the tape as ground
+Every fill carries `c: "exact" | "probable"`, and every probable one carries `r`
+saying **why**. That distinction is the whole ball game:
+
+- `amb` is as certain as exact — the order survived and its volume fell, so the
+  trade definitely happened; only the price is in doubt.
+- `front` is a real inference from a real surviving touch.
+- `empty` is a **default, not a deduction**. Nothing survives on that side, so
+  there is nothing to compare against. A plain cancel on a thin item — and most
+  of 18,808 items are one trader's lone order — lands here every single time and
+  is indistinguishable from a sweep. If `empty` carries a large share of the ISK,
+  the tape is inflated and the test needs tightening. **Never treat the tape as ground
 truth without running `tools/validate-tape.mjs`** — it sums a day's inferred
 fills per type and divides by the volume ESI actually reports. Near 1.0 is
 healthy; systematically under means fills are being lost, over means cancels are
@@ -95,6 +106,7 @@ timestamp,type_id,best_buy,best_sell
 ```json
 {"t":"2026-09-15T19:45:00.000Z","i":15614,"b":[[141900,121,1]],"a":[[159900,6,1]]}
 {"t":"2026-09-15T19:45:00.000Z","i":15614,"p":159900,"q":658,"s":"a","c":"exact"}
+{"t":"2026-09-15T19:45:00.000Z","i":15614,"p":159800,"q":150,"s":"a","c":"probable","r":"empty"}
 ```
 
 An empty CSV field means no order on that side at Jita. In the tape, `s` is the
@@ -120,7 +132,7 @@ node tools/validate-tape.mjs 2026-09-22                    # is the tape honest?
 npm test
 ```
 
-39 checks across three suites (9 + 13 + 17), all against a fake in-process ESI — no network.
+45 checks across three suites (9 + 13 + 23), all against a fake in-process ESI — no network.
 Pagination via `x-pages`, best-bid/ask reduction, the Jita filter, ladder merging
 and the level cap, delta encoding, retention and gzip, and the full fill-inference
 table including a reconstruction of a real 868-unit sweep.

@@ -40,7 +40,7 @@ const only = (ev, k) => ev.filter((e) => e.k === k);
   const now  = mk([[1, 15614, 159900, 80, false]]);
   const ev = diff(prev, now, NOW);
   check('fill alongside a reprice is downgraded to probable',
-    only(ev, 'fill'), [{ k: 'fill', i: 15614, p: 165700, q: 15, s: 'a', c: 'probable' }]);
+    only(ev, 'fill'), [{ k: 'fill', i: 15614, p: 165700, q: 15, s: 'a', c: 'probable', r: 'amb' }]);
 }
 
 // 4 — a vanished order AT the front is a fill; one BEHIND the touch is a cancel
@@ -133,6 +133,53 @@ const only = (ev, k) => ev.filter((e) => e.k === k);
   check('...at the right prices and sizes',
     f.map((x) => [x.p, x.q, x.c]).sort(),
     [[159800, 150, 'probable'], [159900, 658, 'exact'], [160000, 60, 'exact']].sort());
+}
+
+// 12 — the reason tag on probable fills: which of the three kinds is it?
+// This is the split that decides whether the tape is observation or guesswork,
+// so each branch gets pinned down separately.
+{
+  // exact fills carry no reason at all
+  const ev = diff(mk([[1, 15614, 159900, 664, false]]), mk([[1, 15614, 159900, 6, false]]), NOW);
+  check('an exact fill carries no reason tag', 'r' in only(ev, 'fill')[0], false);
+}
+{
+  // a live touch survives on the same side -> genuine inference
+  const prev = mk([[1, 15614, 159800, 150, false], [2, 15614, 163500, 29, false]]);
+  const now  = mk([[2, 15614, 163500, 29, false]]);
+  check('a vanish ahead of a LIVE touch is tagged front',
+    only(diff(prev, now, NOW), 'fill').map((f) => [f.p, f.r]), [[159800, 'front']]);
+}
+{
+  // the whole side cleared -> nothing to compare against, so it is a default
+  const prev = mk([[1, 15614, 159800, 150, false], [2, 15614, 163500, 29, false]]);
+  check('a vanish with the side emptied is tagged empty',
+    only(diff(prev, new Map(), NOW), 'fill').map((f) => [f.p, f.r]).sort(),
+    [[159800, 'empty'], [163500, 'empty']].sort());
+}
+{
+  // The subtle one: the TYPE is still on the book, but every ask is gone.
+  // touches() leaves a = Infinity there, and `o.p <= Infinity` is always true,
+  // so this silently looked like a front-of-queue fill before the tag existed.
+  const prev = mk([[1, 15614, 159800, 150, false], [2, 15614, 141900, 121, true]]);
+  const now  = mk([[2, 15614, 141900, 121, true]]);
+  check('an emptied ASK side is tagged empty even though bids survive',
+    only(diff(prev, now, NOW), 'fill').map((f) => [f.p, f.s, f.r]), [[159800, 'a', 'empty']]);
+}
+{
+  // and the mirror image: bids all gone, asks still there
+  const prev = mk([[1, 15614, 141900, 121, true], [2, 15614, 159800, 150, false]]);
+  const now  = mk([[2, 15614, 159800, 150, false]]);
+  check('an emptied BID side is tagged empty even though asks survive',
+    only(diff(prev, now, NOW), 'fill').map((f) => [f.p, f.s, f.r]), [[141900, 'b', 'empty']]);
+}
+{
+  // a cancel must still be a cancel, and carry no fill reason
+  const prev = mk([[1, 15614, 170000, 500, false], [2, 15614, 163500, 29, false]]);
+  const now  = mk([[2, 15614, 163500, 29, false]]);
+  const ev = diff(prev, now, NOW);
+  check('an order behind a live touch is still a cancel, untagged',
+    [only(ev, 'cancel').map((c) => c.p), only(ev, 'fill').length], [[170000], 0]);
 }
 
 console.log(fail ? `\n${fail} check(s) failed` : '\nall checks passed');

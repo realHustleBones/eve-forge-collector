@@ -114,12 +114,21 @@ export function diff(prev, now, nowTs) {
     if (!n) {
       if (o.e && nowTs > o.e) { out.push({ k: 'expire', i: o.t, p: o.p, q: o.v, s: o.b ? 'b' : 'a' }); continue; }
       const t = tch.get(o.t);
-      // No surviving orders on that side at all: everything there cleared.
-      const front = !t ? true
-        : o.b ? o.p >= t.b            // bid at or above the best surviving bid
-              : o.p <= t.a;           // ask at or below the best surviving ask
+      // Two very different reasons an order that vanished gets scored a fill,
+      // and they do NOT deserve the same trust:
+      //   'front' — a real surviving order exists on that side and this one was
+      //             at or ahead of it. That is an inference from evidence.
+      //   'empty' — nothing survives on that side at all (or the type left the
+      //             book entirely), so there is no touch to compare against.
+      //             Scoring it a fill is a DEFAULT, not a deduction. On a market
+      //             where most items are one trader's lone order, a plain cancel
+      //             lands here every time and is indistinguishable from a sweep.
+      // Tag which one it was so the split can be measured instead of argued about.
+      const touch = o.b ? (t ? t.b : -Infinity) : (t ? t.a : Infinity);
+      const empty = !Number.isFinite(touch);
+      const front = empty || (o.b ? o.p >= touch : o.p <= touch);
       out.push(front
-        ? { k: 'fill', i: o.t, p: o.p, q: o.v, s: o.b ? 'b' : 'a', c: 'probable' }
+        ? { k: 'fill', i: o.t, p: o.p, q: o.v, s: o.b ? 'b' : 'a', c: 'probable', r: empty ? 'empty' : 'front' }
         : { k: 'cancel', i: o.t, p: o.p, q: o.v, s: o.b ? 'b' : 'a' });
       continue;
     }
@@ -128,7 +137,10 @@ export function diff(prev, now, nowTs) {
       out.push({ k: 'reprice', i: o.t, from: o.p, to: n.p, q: n.v, s: o.b ? 'b' : 'a' });
       // A reprice and a fill inside one interval: the fill's price is ambiguous
       // (before or after the move), so it is never 'exact'.
-      if (n.v < o.v) out.push({ k: 'fill', i: o.t, p: o.p, q: o.v - n.v, s: o.b ? 'b' : 'a', c: 'probable' });
+      // r:'amb' — the order SURVIVED and its volume fell, so the trade is as
+      // certain as an exact fill. Only the price is in doubt (before or after
+      // the move). Lumping this in with 'empty' would badly understate the tape.
+      if (n.v < o.v) out.push({ k: 'fill', i: o.t, p: o.p, q: o.v - n.v, s: o.b ? 'b' : 'a', c: 'probable', r: 'amb' });
       continue;
     }
 
@@ -185,7 +197,7 @@ async function main() {
 
   const ev = diff(prev.book, book, Date.parse(iso));
   const fills = ev.filter((e) => e.k === 'fill');
-  const lines = fills.map((f) => JSON.stringify({ t: iso, i: f.i, p: f.p, q: f.q, s: f.s, c: f.c }));
+  const lines = fills.map((f) => JSON.stringify({ t: iso, i: f.i, p: f.p, q: f.q, s: f.s, c: f.c, ...(f.r ? { r: f.r } : {}) }));
 
   fs.mkdirSync(FILLS_DIR, { recursive: true });
   if (lines.length) fs.appendFileSync(dayFile(today), lines.join('\n') + '\n');

@@ -44,6 +44,7 @@ let tobLast = new Map();
 const stats = { started: new Date().toISOString(), ticks: 0, lastTick: null, lastError: null,
                 orders: 0, pages: 0, fillsLastTick: 0, unitsLastTick: 0, iskLastTick: 0, fillsToday: 0, today: null,
                 exactLastTick: null, probableLastTick: null, topFillLastTick: null,
+                ambLastTick: null, frontLastTick: null, emptyLastTick: null,
                 cancelsLastTick: 0, repricesLastTick: 0, expiresLastTick: 0 };
 
 // ---------------------------------------------------------------- ladders
@@ -145,7 +146,7 @@ async function tick() {
     ev = diff(prev.book, book, Date.parse(iso));
     fills = ev.filter((e) => e.k === 'fill');
     appendLines(FILLS, d, fills.map((f) =>
-      JSON.stringify({ t: iso, i: f.i, p: f.p, q: f.q, s: f.s, c: f.c })));
+      JSON.stringify({ t: iso, i: f.i, p: f.p, q: f.q, s: f.s, c: f.c, ...(f.r ? { r: f.r } : {}) })));
   }
 
   // --- depth (only what moved)
@@ -192,6 +193,16 @@ async function tick() {
   const all = agg(fills);
   const ex = agg(fills.filter((f) => f.c === 'exact'));
   const pr = agg(fills.filter((f) => f.c === 'probable'));
+  // 'probable' is three different things wearing one label. Ranked by trust:
+  //   amb   — order survived, volume fell. The trade is certain; only the price
+  //           is ambiguous because it repriced in the same window.
+  //   front — order vanished from at or ahead of a live surviving touch.
+  //   empty — order vanished and nothing survives on that side, so there was
+  //           nothing to compare it to. This is the bucket a plain cancel on a
+  //           thin item falls into, and the one that can inflate the tape.
+  const amb = agg(fills.filter((f) => f.r === 'amb'));
+  const frt = agg(fills.filter((f) => f.r === 'front'));
+  const emp = agg(fills.filter((f) => f.r === 'empty'));
   const cnt = (k) => ev.reduce((s, e) => s + (e.k === k ? 1 : 0), 0);
   // One misclassified whale can carry a whole tick's ISK while the average
   // hides it, so name the biggest single inferred fill every tick.
@@ -201,12 +212,13 @@ async function tick() {
   stats.ticks++; stats.lastTick = iso; stats.lastError = null;
   stats.fillsLastTick = all.n; stats.unitsLastTick = all.q; stats.iskLastTick = all.k;
   stats.exactLastTick = ex; stats.probableLastTick = pr;
+  stats.ambLastTick = amb; stats.frontLastTick = frt; stats.emptyLastTick = emp;
   stats.cancelsLastTick = cnt('cancel'); stats.repricesLastTick = cnt('reprice'); stats.expiresLastTick = cnt('expire');
   stats.topFillLastTick = top ? { i: top.i, p: top.p, q: top.q, s: top.s, c: top.c, isk: top.p * top.q } : null;
   stats.fillsToday += all.n;
 
   log(`${pages}p ${book.size} orders · fills ${all.n} (${all.q.toLocaleString()}u, ${B(all.k)})` +
-      ` [exact ${ex.n} ${ex.q.toLocaleString()}u ${B(ex.k)} · prob ${pr.n} ${pr.q.toLocaleString()}u ${B(pr.k)}]` +
+      ` [exact ${ex.n} ${B(ex.k)} · amb ${amb.n} ${B(amb.k)} · front ${frt.n} ${B(frt.k)} · empty ${emp.n} ${B(emp.k)}]` +
       ` · cx ${cnt('cancel')} rp ${cnt('reprice')} xp ${cnt('expire')}` +
       (top ? ` · top ${top.i} ${top.q.toLocaleString()}@${top.p.toLocaleString()}=${B(top.p * top.q)}${top.c === 'exact' ? '' : '?'}` : '') +
       ` · depth ${drows.length} · tob ${trows.length}` +
