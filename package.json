@@ -11,7 +11,7 @@
     "tape": "node tape.mjs",
     "universe": "node universe.mjs",
     "series": "node tools/series.mjs",
-    "test": "node tools/test-collect.mjs && node tools/test-depth.mjs && node tools/test-tape.mjs"
+    "test": "node tools/test-collect.mjs && node tools/test-depth.mjs && node tools/test-tape.mjs && node tools/test-gen.mjs && node tools/test-worker.mjs"
   },
   "engines": {
     "node": ">=20"

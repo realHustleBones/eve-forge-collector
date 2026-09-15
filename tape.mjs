@@ -57,15 +57,56 @@ async function getPage(page) {
       }
       if (r.status === 420 || r.status === 429 || r.status >= 500) { await sleep(1000 * 2 ** attempt); continue; }
       if (!r.ok) return { ok: false, status: r.status, page };
-      return { ok: true, page, body: await r.json(), pages: Number(r.headers.get('x-pages') || 1) };
+      return {
+        ok: true, page, body: await r.json(), pages: Number(r.headers.get('x-pages') || 1),
+        // Cache headers. `expires` and `date` come from the SAME response, so
+        // their difference is the true time to the next generation regardless
+        // of how far this container's clock has drifted from CCP's.
+        lastModified: r.headers.get('last-modified'),
+        expires: r.headers.get('expires'),
+        date: r.headers.get('date'),
+      };
     } catch { await sleep(1000 * 2 ** attempt); }
   }
   return { ok: false, status: 0, page };
 }
 
-export async function snapshot() {
+// Read the generation stamp + time-to-live off a page response.
+export function genOf(r) {
+  const ttlMs = r.expires && r.date ? Date.parse(r.expires) - Date.parse(r.date) : NaN;
+  return { lastModified: r.lastModified || null, ttlMs: Number.isFinite(ttlMs) ? ttlMs : null };
+}
+
+// ESI says exactly when the next generation lands, so sleep to that instant
+// instead of guessing with a fixed timer. A fixed timer drifts against the cache
+// and eventually does one of two bad things: lands twice inside one generation
+// (a full scan that can only report "nothing happened"), or skips a generation
+// entirely (a diff spanning two intervals while every row it writes claims one).
+// Neither is visible in the output, which is what makes it worth fixing.
+export function planNext(gen, { interval, pad = 5000, min = 15_000 } = {}) {
+  const d = gen && Number.isFinite(gen.ttlMs) ? gen.ttlMs + pad : interval;
+  // Clamp both ends: a malformed or already-stale header must not spin us, and
+  // a far-future one must not park the worker indefinitely.
+  return Math.min(Math.max(d, min), interval * 2);
+}
+
+// prevGen: the generation returned by the previous call. Pass it and an
+// unchanged book costs ONE page instead of all 411.
+export async function snapshot(prevGen = null) {
   const first = await getPage(1);
   if (!first.ok) throw new Error(`page 1 failed: HTTP ${first.status}`);
+  const gen = genOf(first);
+
+  // ESI stamps Last-Modified with when the GENERATION was cached, and keeps it
+  // consistent across every page of a paginated resource. So page 1 alone
+  // identifies the generation: if the stamp hasn't moved, pages 2..411 cannot
+  // have changed either, and fetching them is ~94 MB spent to rediscover the
+  // book already in memory. (A per-page ETag would NOT do this job — it only
+  // describes its own page, so page 1 could 304 while page 200 differs.)
+  if (prevGen && prevGen.lastModified && gen.lastModified && gen.lastModified === prevGen.lastModified) {
+    return { unchanged: true, book: null, pages: first.pages, failed: 0, gen };
+  }
+
   const book = new Map();
   const take = (orders) => {
     for (const o of orders) {
@@ -89,7 +130,7 @@ export async function snapshot() {
   if (failed > Math.max(3, pages * 0.05)) {
     throw new Error(`${failed}/${pages} pages failed — a partial book would invent fills`);
   }
-  return { book, pages, failed };
+  return { book, pages, failed, gen, unchanged: false };
 }
 
 // The surviving touch per (type, side): best ask and best bid still on the book.
@@ -186,7 +227,7 @@ async function main() {
   const iso = new Date().toISOString();
   const today = iso.slice(0, 10);
 
-  const { book, pages } = await snapshot();
+  const { book, pages } = await snapshot();   // no prevGen: always a full scan
   const prev = loadState();
   saveState(iso, book);
 

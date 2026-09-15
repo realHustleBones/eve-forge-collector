@@ -20,13 +20,18 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import http from 'node:http';
 import crypto from 'node:crypto';
-import { snapshot, diff } from './tape.mjs';
+import { snapshot, diff, planNext } from './tape.mjs';
 
 const ROOT = process.env.DATA_ROOT || process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
 const INTERVAL = Number(process.env.INTERVAL_SEC || 300) * 1000;
 const LEVELS = Number(process.env.LEVELS || 25);
 const RETAIN_DEPTH = Number(process.env.RETAIN_DAYS || 90);
 const PORT = Number(process.env.PORT || 3000);
+// How long after a generation expires to go looking for the next one. A couple
+// of seconds of slack absorbs CDN jitter without polling early, which CCP
+// explicitly asks clients not to do.
+const PAD = Number(process.env.TICK_PAD_SEC || 5) * 1000;
+const MIN_DELAY = Number(process.env.TICK_MIN_SEC || 15) * 1000;
 
 const FILLS = path.join(ROOT, 'fills');
 const DEPTH = path.join(ROOT, 'depth');
@@ -38,11 +43,14 @@ const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 const day = (iso) => iso.slice(0, 10);
 
 let prev = null;               // { ts, book } — held in memory across ticks
+let gen = null;                // ESI generation stamp from the last scan
+let nextDelayMs = INTERVAL;    // what the scheduler will actually wait
 let universe = null;
 let ladderHash = new Map();
 let tobLast = new Map();
 const stats = { started: new Date().toISOString(), ticks: 0, lastTick: null, lastError: null,
                 orders: 0, pages: 0, fillsLastTick: 0, unitsLastTick: 0, iskLastTick: 0, fillsToday: 0, today: null,
+                lastScan: null, skipped: 0, genLastModified: null, nextDelaySec: null,
                 exactLastTick: null, probableLastTick: null, topFillLastTick: null,
                 ambLastTick: null, frontLastTick: null, emptyLastTick: null,
                 cancelsLastTick: 0, repricesLastTick: 0, expiresLastTick: 0 };
@@ -137,7 +145,24 @@ async function tick() {
   const d = day(iso);
   if (stats.today !== d) { stats.today = d; stats.fillsToday = 0; loadUniverse(); }
 
-  const { book, pages } = await snapshot();
+  const snap = await snapshot(gen);
+  gen = snap.gen;
+  nextDelayMs = planNext(gen, { interval: INTERVAL, pad: PAD, min: MIN_DELAY });
+  stats.lastScan = iso; stats.lastError = null;
+  stats.genLastModified = gen ? gen.lastModified : null;
+  stats.nextDelaySec = Math.round(nextDelayMs / 1000);
+
+  // Same generation as last time: the book is byte-identical, so there is
+  // nothing to diff and nothing to write. Cost of finding that out is one page
+  // instead of 411.
+  if (snap.unchanged) {
+    stats.skipped++;
+    log(`gen unchanged (${gen.lastModified}) · skipped ${Math.max(snap.pages - 1, 0)} pages · ` +
+        `next in ${(nextDelayMs / 1000).toFixed(0)}s · rss ${(process.memoryUsage().rss / 1e6).toFixed(0)}MB`);
+    return;
+  }
+
+  const { book, pages } = snap;
   stats.orders = book.size; stats.pages = pages;
 
   // --- tape
@@ -209,7 +234,7 @@ async function tick() {
   const top = fills.reduce((bst, f) => (!bst || f.p * f.q > bst.p * bst.q ? f : bst), null);
   const B = (x) => (x / 1e9).toFixed(2) + 'B';
 
-  stats.ticks++; stats.lastTick = iso; stats.lastError = null;
+  stats.ticks++; stats.lastTick = iso;
   stats.fillsLastTick = all.n; stats.unitsLastTick = all.q; stats.iskLastTick = all.k;
   stats.exactLastTick = ex; stats.probableLastTick = pr;
   stats.ambLastTick = amb; stats.frontLastTick = frt; stats.emptyLastTick = emp;
@@ -223,41 +248,58 @@ async function tick() {
       (top ? ` · top ${top.i} ${top.q.toLocaleString()}@${top.p.toLocaleString()}=${B(top.p * top.q)}${top.c === 'exact' ? '' : '?'}` : '') +
       ` · depth ${drows.length} · tob ${trows.length}` +
       (zipped ? ` · gz ${zipped}` : '') + (pruned ? ` · pruned ${pruned}` : '') +
-      ` · rss ${(process.memoryUsage().rss / 1e6).toFixed(0)}MB · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+      ` · rss ${(process.memoryUsage().rss / 1e6).toFixed(0)}MB · ${((Date.now() - t0) / 1000).toFixed(1)}s` +
+      ` · next ${(nextDelayMs / 1000).toFixed(0)}s`);
 }
 
 // ------------------------------------------------------------------- main
 
-let running = false, stopping = false;
+let running = false, stopping = false, timer = null;
+
+// Self-rescheduling instead of setInterval, because the wait is no longer a
+// constant — each tick learns from ESI's own Expires header when the next
+// generation is due and sleeps exactly that long. A failed tick falls back to
+// the fixed interval rather than hammering.
 async function loop() {
   if (running || stopping) return;                 // a slow tick must not overlap the next
   running = true;
   try { await tick(); }
-  catch (e) { stats.lastError = `${new Date().toISOString()} ${e.message}`; log('TICK FAILED', e.message); }
-  finally { running = false; }
+  catch (e) {
+    stats.lastError = `${new Date().toISOString()} ${e.message}`;
+    log('TICK FAILED', e.message);
+    nextDelayMs = INTERVAL;
+  } finally {
+    running = false;
+    if (!stopping) timer = setTimeout(loop, nextDelayMs);
+  }
 }
 
 const BOOT = Date.now();
 
+// Liveness is measured on lastScan, NOT lastTick. A run of generations where
+// nothing changed is a healthy worker doing its job cheaply; judging it on
+// lastTick would kill a process that is working correctly.
+const staleAfter = () => Math.max(nextDelayMs, INTERVAL) * 3;
+
 // Railway healthchecks run at DEPLOY time only — nothing polls /health once the
-// deploy is live. So the worker has to notice its own death: if no tick has
+// deploy is live. So the worker has to notice its own death: if no scan has
 // landed in 3 intervals, exit non-zero and let restartPolicyType ALWAYS bring
 // it back. Without this a wedged process would sit there looking deployed.
 setInterval(() => {
-  if (!stats.lastTick) return;
-  const age = Date.now() - Date.parse(stats.lastTick);
-  if (age > INTERVAL * 3) {
-    log(`WATCHDOG last tick ${(age / 60000).toFixed(1)}m ago (>3 intervals) — exiting for restart`);
+  if (!stats.lastScan) return;
+  const age = Date.now() - Date.parse(stats.lastScan);
+  if (age > staleAfter()) {
+    log(`WATCHDOG last scan ${(age / 60000).toFixed(1)}m ago (>3 intervals) — exiting for restart`);
     process.exit(1);
   }
 }, Math.min(INTERVAL, 60_000)).unref();
 
 http.createServer((req, res) => {
-  const stale = stats.lastTick && Date.now() - Date.parse(stats.lastTick) > INTERVAL * 3;
-  // Starting up counts as healthy: the very first tick is a full Forge scan and
+  const stale = !!stats.lastScan && Date.now() - Date.parse(stats.lastScan) > staleAfter();
+  // Starting up counts as healthy: the very first scan is a full Forge sweep and
   // the deploy healthcheck would otherwise fail before it finishes.
-  const booting = stats.ticks === 0 && Date.now() - BOOT < INTERVAL * 2;
-  const ok = booting || (stats.ticks > 0 && !stale);
+  const booting = !stats.lastScan && Date.now() - BOOT < INTERVAL * 2;
+  const ok = booting || (!!stats.lastScan && !stale);
   if (req.url === '/health') {
     res.writeHead(ok ? 200 : 503, { 'Content-Type': 'text/plain' });
     return res.end(ok ? (booting ? 'booting' : 'ok') : 'stale');
@@ -268,11 +310,15 @@ http.createServer((req, res) => {
 }).listen(PORT, () => log(`health on :${PORT} · interval ${INTERVAL / 1000}s · data ${ROOT}`));
 
 for (const sig of ['SIGTERM', 'SIGINT']) {
-  process.on(sig, () => { stopping = true; log(`${sig} — finishing current tick then exiting`); setTimeout(() => process.exit(0), running ? 90_000 : 0); });
+  process.on(sig, () => {
+    stopping = true;
+    if (timer) clearTimeout(timer);
+    log(`${sig} — finishing current tick then exiting`);
+    setTimeout(() => process.exit(0), running ? 90_000 : 0);
+  });
 }
 
 loadUniverse();
 prev = loadState();
 log(prev ? `resumed from state at ${prev.ts} (${prev.book.size} orders)` : 'cold start — first tick produces no tape');
-await loop();
-setInterval(loop, INTERVAL);
+await loop();   // loop() reschedules itself off ESI's Expires header

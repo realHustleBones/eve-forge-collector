@@ -14,10 +14,10 @@ From the unzipped folder:
 
 ```bash
 cd eve-forge-collector
-node tools/test-collect.mjs && node tools/test-depth.mjs && node tools/test-tape.mjs
+npm test
 ```
 
-All three must say `all checks passed`. If they don't, stop and tell me — nothing
+All five suites must say `all checks passed` (75 checks). If they don't, stop and tell me — nothing
 below is worth doing against a broken collector.
 
 ```bash
@@ -100,7 +100,8 @@ either way.
 | name | value | why |
 |---|---|---|
 | `ESI_UA` | your contact string | same as GitHub |
-| `INTERVAL_SEC` | `300` | optional. See the bandwidth note below before lowering it |
+| `INTERVAL_SEC` | `300` | optional **fallback**. The real schedule comes from ESI's `Expires` header |
+| `TICK_PAD_SEC` | `5` | optional. Slack added after a generation expires, to absorb CDN jitter without polling early |
 | `RETAIN_DAYS` | `90` | optional. Depth retention only — fills are never pruned |
 
 Do **not** set `PORT`. Railway injects it and the worker binds to it.
@@ -119,7 +120,11 @@ What `/status` should look like after ~15 minutes:
 ```json
 {
   "ticks": 3,
+  "skipped": 1,
   "lastTick": "2026-09-15T19:45:00.000Z",
+  "lastScan": "2026-09-15T19:47:31.000Z",
+  "genLastModified": "Mon, 15 Sep 2026 19:45:00 GMT",
+  "nextDelaySec": 154,
   "orders": 312847,
   "pages": 313,
   "fillsLastTick": 1840,
@@ -129,17 +134,26 @@ What `/status` should look like after ~15 minutes:
 }
 ```
 
-Four things to read there:
+What to read there:
 
-- **`ticks` climbing** by one every 5 minutes. If it sticks at 1, the scan is
-  failing — check `lastError` and the deploy logs.
+- **`ticks` climbing.** A tick is a generation that actually *moved*. If it
+  sticks at 1 while `skipped` climbs, ESI is serving you the same generation
+  forever — check `lastError` and the deploy logs.
+- **`skipped`.** Generations that came back unchanged, costing one request each
+  instead of 411. A few is normal, especially right after a restart.
+- **`lastScan` vs `lastTick`.** `lastScan` is the liveness signal and what the
+  watchdog and `/health` judge — a run of unchanged generations is a healthy
+  worker being cheap, not a dead one.
+- **`nextDelaySec`** should sit a little under 300. That is ESI's `Expires`
+  driving the schedule. If it pins to 300 every time, the cache headers aren't
+  arriving and the worker has fallen back to the fixed timer.
 - **`orders` around 250k–350k.** Much lower means pages are failing; the worker
   aborts rather than write a partial book, since a partial book invents fills.
 - **`fillsLastTick` is 0 on the very first tick and only the first.** The tape is
   a difference between two snapshots — there is nothing to compare against yet.
-- **`rssMB`.** This is the number to actually watch. If it runs near your plan's
-  ceiling, tell me and I'll swap the book from a Map of objects to parallel typed
-  arrays — 32 bytes an order instead of ~150, about a 5× cut.
+- **`rssMB`.** If it runs near your plan's ceiling, tell me and I'll swap the
+  book from a Map of objects to parallel typed arrays — 32 bytes an order
+  instead of ~150, about a 5× cut.
 
 ---
 
@@ -225,6 +239,8 @@ You can always tighten it later; the data formats don't change.
 
 | symptom | cause | fix |
 |---|---|---|
+| `nextDelaySec` always exactly 300 | no `Expires`/`Date` from ESI, fixed-timer fallback in use | harmless, but tell me — it means the cache alignment isn't working |
+| `skipped` climbing but `ticks` frozen | same generation served repeatedly | check `genLastModified` is actually advancing |
 | deploy fails healthcheck, logs show `/data` errors | no volume | Part 3b |
 | `ticks` stuck at 1, `lastError` mentions pages | ESI refusing or rate-limiting | check `ESI_UA` is set; the worker backs off on its own |
 | every restart logs `cold start` | volume not mounted, or mounted at the wrong path | mount path must be exactly `/data` |

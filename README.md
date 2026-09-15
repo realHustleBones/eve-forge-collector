@@ -26,11 +26,42 @@ can resume.
 2. **Attach a volume mounted at `/data`.** Without one the filesystem is
    ephemeral and every restart loses the state file, which means a cold start and
    a gap in the tape. 5 GB (Hobby) is ample — about 0.85 GB after a year.
-3. Set `ESI_UA` to a contact string. Optionally `INTERVAL_SEC` (default 300) and
-   `RETAIN_DAYS` (default 90, depth only — fills are kept forever).
+3. Set `ESI_UA` to a contact string. Optionally `INTERVAL_SEC` (fallback only —
+   see below), `TICK_PAD_SEC` (default 5) and `RETAIN_DAYS` (default 90, depth
+   only — fills are kept forever).
 4. `GET /health` returns 200 while ticks are landing, 503 if the last one is
    older than 3 intervals. `GET /status` returns tick count, order count, fills
    on the last tick, and **`rssMB`** — watch that one.
+
+### The worker follows ESI's cache, not a stopwatch
+
+`INTERVAL_SEC` is a **fallback**, not the schedule. Each scan reads `Expires`
+and `Date` off page 1 and sleeps until the next generation is actually due —
+`Expires - Date` rather than `Expires - now`, so a container with a wrong clock
+still gets it right.
+
+Before committing to 411 pages it checks page 1's `Last-Modified`. ESI stamps
+that with when the *generation* was cached and keeps it consistent across every
+page of a paginated resource, so page 1 alone identifies the generation: if the
+stamp hasn't moved, pages 2-411 cannot have moved either. An unchanged
+generation therefore costs **one request instead of 411**.
+
+(A per-page `ETag` will not do this job. It describes only its own page, so
+page 1 could return 304 while page 200 differs.)
+
+A fixed timer fails two ways, neither of them visible in the output:
+
+- **lands twice in one generation** — a full scan that can only report "nothing
+  happened". Guaranteed after every restart, since restarting re-phases the timer.
+- **skips a generation** — one diff spanning ten minutes while every row it
+  writes is stamped as five.
+
+The second one is the dangerous one, because the data looks fine.
+
+**Rate limit.** CCP metered `/markets/{region_id}/orders` on 24 Feb 2026:
+12,000 tokens, 2 per request. Their own worked example is every region at every
+expiry — 1,723 pages × 2 × 3 = 10,338 tokens — described as well within budget.
+One region at the same cadence is **411 × 2 × 3 = 2,466, about 20%.**
 
 **Cost**, at Railway's published rates ($0.00000386/GB/s memory,
 $0.00000772/vCPU/s, $0.00000006/GB/s volume): the worker is idle ~95% of the
@@ -38,11 +69,18 @@ time, so roughly **$3-7/month** of compute plus $0.78 for a 5 GB volume. Well
 inside the $5 Hobby minimum.
 
 **The real constraint is bandwidth, not money.** Scanning the whole Forge book
-every 5 minutes pulls 250-350 pages of ~230 KB, which is **55-80 MB a scan,
-16-22 GB a day, 475-665 GB a month inbound.** Railway's published rate is
-egress-only, so this should be free — but it is a lot of traffic and worth
-confirming against fair-use before leaving it running. Halving the cadence to 10
-minutes halves it and costs you little, since most items don't move that fast.
+pulls 250-350 pages of ~230 KB, which is **55-80 MB a scan, 16-22 GB a day,
+475-665 GB a month inbound.** Railway's published rate is egress-only, so this
+should be free — but it is a lot of traffic and worth confirming against
+fair-use before leaving it running.
+
+Cache alignment does **not** materially reduce that figure, and it would be
+wrong to claim otherwise: when the book genuinely changes you still have to
+download it, and in a live market it changes every generation. What alignment
+removes is the *redundant* scans — the ones after every restart, and the ones
+drift causes — which are pure waste rather than a standing cost. The lever that
+actually cuts the total is cadence: `INTERVAL_SEC=600` roughly halves it and
+costs little, since almost nothing in that book moves twice inside ten minutes.
 
 **Memory** is the other thing to watch. The book is held twice during a diff
 (previous and current). If `rssMB` from `/status` runs near your plan's ceiling,
@@ -132,10 +170,17 @@ node tools/validate-tape.mjs 2026-09-22                    # is the tape honest?
 npm test
 ```
 
-45 checks across three suites (9 + 13 + 23), all against a fake in-process ESI — no network.
+75 checks across five suites (9 + 13 + 23 + 18 + 12), all against a fake
+in-process ESI — no network.
 Pagination via `x-pages`, best-bid/ask reduction, the Jita filter, ladder merging
 and the level cap, delta encoding, retention and gzip, and the full fill-inference
 table including a reconstruction of a real 868-unit sweep.
+
+`test-gen.mjs` covers cache-generation detection and the scheduler's clamps,
+including a server whose clock disagrees with the client's. `test-worker.mjs`
+boots the **real worker** against a fake ESI and drives it through cold start,
+an unchanged generation, a generation that moved, and a restart that has to
+resume from the volume instead of cold starting.
 
 ## Seeded history
 
