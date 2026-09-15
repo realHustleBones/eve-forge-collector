@@ -17,7 +17,7 @@ cd eve-forge-collector
 npm test
 ```
 
-All five suites must say `all checks passed` (85 checks). If they don't, stop and tell me — nothing
+All six suites must say `all checks passed` (115 checks). If they don't, stop and tell me — nothing
 below is worth doing against a broken collector.
 
 ```bash
@@ -102,6 +102,7 @@ either way.
 | `ESI_UA` | your contact string | same as GitHub |
 | `INTERVAL_SEC` | `300` | optional **fallback**. The real schedule comes from ESI's `Expires` header |
 | `TICK_PAD_SEC` | `5` | optional. Slack added after a generation expires, to absorb CDN jitter without polling early |
+| `READ_TOKEN` | a random string | optional but recommended. Makes every read endpoint require `?k=<token>`; `/health` and `/status` stay open |
 | `RETAIN_DAYS` | `90` | optional. Depth retention only — fills are never pruned |
 
 Do **not** set `PORT`. Railway injects it and the worker binds to it.

@@ -21,6 +21,7 @@ import zlib from 'node:zlib';
 import http from 'node:http';
 import crypto from 'node:crypto';
 import { snapshot, diff, planNext } from './tape.mjs';
+import { makeReader } from './read.mjs';
 
 const ROOT = process.env.DATA_ROOT || process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
 const INTERVAL = Number(process.env.INTERVAL_SEC || 300) * 1000;
@@ -318,20 +319,48 @@ setInterval(() => {
   }
 }, Math.min(INTERVAL, 60_000)).unref();
 
-http.createServer((req, res) => {
+const reader = makeReader({ root: ROOT });
+
+const ENDPOINTS = {
+  '/days': 'which days exist, per dataset',
+  '/fills': '?type=&day=&from=&to=&conf= — the reconstructed trade tape',
+  '/tape': '?type=&day= — volume by price and volume by hour, aggregated',
+  '/depth': '?type=&day=[&at=] — ladders: the whole day, or the one nearest a time',
+  '/series': '?type=&from=&to= — top of book over time',
+  '/raw': '?set=fills|depth&day= — the whole day file, streamed',
+};
+
+http.createServer(async (req, res) => {
+  // Parse the path so a query string can't defeat the health route.
+  let pathname = '/';
+  try { pathname = new URL(req.url, 'http://x').pathname; } catch { /* keep '/' */ }
+
   const stale = !!stats.lastScan && Date.now() - Date.parse(stats.lastScan) > staleAfter();
   // Starting up counts as healthy: the very first scan is a full Forge sweep and
   // the deploy healthcheck would otherwise fail before it finishes.
   const booting = !stats.lastScan && Date.now() - BOOT < INTERVAL * 2;
   const ok = booting || (!!stats.lastScan && !stale);
-  if (req.url === '/health') {
+  if (pathname === '/health') {
     res.writeHead(ok ? 200 : 503, { 'Content-Type': 'text/plain' });
     return res.end(ok ? (booting ? 'booting' : 'ok') : 'stale');
   }
+
+  // Read endpoints get first refusal, ahead of the /status catch-all. A reader
+  // blowing up must never take down the collector, so it is fully contained.
+  try {
+    if (await reader(req, res)) return;
+  } catch (e) {
+    log('read endpoint failed:', e.message);
+    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: e.message }));
+  }
+
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ ...stats, stale, rssMB: +(process.memoryUsage().rss / 1e6).toFixed(0),
-                           intervalSec: INTERVAL / 1000, universe: universe ? universe.size : 'all' }, null, 2));
-}).listen(PORT, () => log(`health on :${PORT} · schedule from ESI Expires (fallback ${INTERVAL / 1000}s) · data ${ROOT}`));
+                           intervalSec: INTERVAL / 1000, universe: universe ? universe.size : 'all',
+                           endpoints: ENDPOINTS, readTokenRequired: !!process.env.READ_TOKEN }, null, 2));
+}).listen(PORT, () => log(`http on :${PORT} · schedule from ESI Expires (fallback ${INTERVAL / 1000}s) · data ${ROOT}` +
+                          (process.env.READ_TOKEN ? ' · read endpoints require ?k=' : '')));
 
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => {

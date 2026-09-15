@@ -151,6 +151,39 @@ the book ~5 minutes, so anything that opens and closes inside one interval is
 invisible; and a full cancel is indistinguishable from a full fill except by
 queue position.
 
+## Getting the data out
+
+The worker serves read endpoints on the same port as `/health`. Generate a
+Railway domain (**Settings -> Networking -> Generate Domain**) and they are
+live. Everything is read-only, streamed, and CORS-open so a browser page can
+call it directly.
+
+| endpoint | what it gives you |
+|---|---|
+| `/days` | which days exist, per dataset |
+| `/fills?type=&day=&from=&to=&conf=` | the reconstructed tape, row by row |
+| `/tape?type=&day=` | **volume by price + volume by hour, aggregated server-side** |
+| `/depth?type=&day=[&at=]` | ladders: the day's series, or the one in force at a moment |
+| `/series?type=&from=&to=` | top of book over time |
+| `/raw?set=fills\|depth&day=` | the whole day file, streamed as a download |
+
+```bash
+curl "https://<app>.up.railway.app/tape?type=15614&day=2026-09-15"
+```
+
+`/tape` is the one to reach for. It aggregates on the server, so drawing a
+volume-by-price histogram costs one small JSON response instead of pulling
+144,000 fill rows into a browser.
+
+**Set `READ_TOKEN`** to a random string and every read endpoint then requires
+`?k=<token>`. `/health` and `/status` stay open so Railway's healthcheck keeps
+working. The archive is public game data, so this is about not leaving an
+unmetered endpoint on the same process that is trying to collect — not secrecy.
+
+Every reader **streams**. A day of depth is ~250k rows and comfortably over
+100 MB; nothing here ever holds a whole file, because the process doing the
+serving is the same one holding a 330k-order book.
+
 ## Data layout
 
 ```
@@ -195,11 +228,16 @@ node tools/validate-tape.mjs 2026-09-22                    # is the tape honest?
 npm test
 ```
 
-85 checks across five suites (9 + 13 + 23 + 18 + 22), all against a fake
+115 checks across six suites (9 + 13 + 23 + 18 + 30 + 22), all against a fake
 in-process ESI — no network.
 Pagination via `x-pages`, best-bid/ask reduction, the Jita filter, ladder merging
 and the level cap, delta encoding, retention and gzip, and the full fill-inference
 table including a reconstruction of a real 868-unit sweep.
+
+`test-read.mjs` builds a small archive on disk and checks every read endpoint's
+arithmetic, plus the two things that bite in production: a day file gzipped
+because the day closed, and a last line half-written because the collector is
+appending while the reader reads.
 
 `test-gen.mjs` covers cache-generation detection and the scheduler's clamps,
 including a server whose clock disagrees with the client's. `test-worker.mjs`
