@@ -54,6 +54,20 @@ w(path.join(ROOT, 'data', '2026-09', `${DAY}.csv`), [
   '2026-09-15T11:00:00.000Z,15614,141800,159800',
 ].join('\n') + '\n');
 
+// A SECOND top-of-book source, standing in for the repo archive that ships
+// inside the deploy. Same day as the volume but hourly, plus a day that only
+// the repo has — which is the case that matters, because every day before the
+// worker existed lives only here.
+const REPO = fs.mkdtempSync(path.join(os.tmpdir(), 'read-repo-'));
+w(path.join(REPO, 'data', '2026-09', `${DAY}.csv`), [
+  'timestamp,type_id,best_buy,best_sell',
+  '2026-09-15T09:00:00.000Z,15614,141000,159000',   // earlier than any volume row
+  '2026-09-15T10:00:00.000Z,15614,141900,159900',   // SAME instant as the volume row
+].join('\n') + '\n');
+w(path.join(REPO, 'data', '2026-08', '2026-08-06.csv.gz'), zlib.gzipSync(
+  'timestamp,type_id,best_buy,best_sell\n2026-08-06T02:48:38.178Z,15614,130000,150000\n'));
+process.env.REPO_DIR = REPO;
+
 const { makeReader } = await import('../read.mjs');
 
 const serve = async (reader) => {
@@ -75,7 +89,9 @@ try {
   // ---- /days
   let r = await s.get('/days');
   check('/days lists fills days, gzipped ones included', r.body.fills, [OLD, DAY]);
-  check('/days lists depth and top-of-book days', [r.body.depth, r.body.tob], [[DAY], [DAY]]);
+  check('/days lists depth days', r.body.depth, [DAY]);
+  check('/days unions top-of-book across BOTH sources', r.body.tob, ['2026-08-06', DAY]);
+  check('...and says which sources it looked in', r.body.tobSources.length, 2);
 
   // ---- /fills
   r = await s.get(`/fills?type=15614&day=${DAY}`);
@@ -127,11 +143,28 @@ try {
   check('...and the latest one when asked past the end', r.body.ladder.t, '2026-09-15T10:30:00.000Z');
 
   // ---- /series
+  // Three rows, not two: 09:00 exists only in the repo source, 10:00 in both
+  // (deduped), 11:00 only on the volume. That interleaving IS the feature.
   r = await s.get(`/series?type=15614&from=${DAY}&to=${DAY}`);
-  check('/series reads top of book for one type', r.body.n, 2);
-  check('...carrying prices through as numbers', r.body.series[1], { t: '2026-09-15T11:00:00.000Z', buy: 141800, sell: 159800 });
+  check('/series merges both sources for a day they share', r.body.n, 3);
+  check('...in time order regardless of which source held which row',
+    r.body.series.map((x) => [x.t.slice(11, 16), x.buy]),
+    [['09:00', 141000], ['10:00', 141900], ['11:00', 141800]]);
+  check('...carrying prices through as numbers', r.body.series.at(-1), { t: '2026-09-15T11:00:00.000Z', buy: 141800, sell: 159800 });
   r = await s.get(`/series?type=28699&from=${DAY}&to=${DAY}`);
   check('...and an empty side reads as null, not zero', r.body.series[0].sell, null);
+
+  // the merge: repo-only history, and a day both sources hold
+  r = await s.get('/series?type=15614&from=2026-08-01&to=2026-09-15');
+  check('/series reaches back into repo-only history',
+    r.body.series[0], { t: '2026-08-06T02:48:38.178Z', buy: 130000, sell: 150000 });
+  check('...merging both sources in time order',
+    r.body.series.map((x) => x.t),
+    ['2026-08-06T02:48:38.178Z', '2026-09-15T09:00:00.000Z',
+     '2026-09-15T10:00:00.000Z', '2026-09-15T11:00:00.000Z']);
+  check('...with the duplicated instant emitted once, not twice',
+    r.body.series.filter((x) => x.t === '2026-09-15T10:00:00.000Z').length, 1);
+  check('...and reporting both sources were used', r.body.sources.sort(), ['repo', 'volume']);
 
   // ---- /raw
   const raw = await fetch(`http://127.0.0.1:${s.port}/raw?set=fills&day=${DAY}`);
@@ -158,5 +191,6 @@ try {
 } finally { s2.srv.close(); }
 
 fs.rmSync(ROOT, { recursive: true, force: true });
+fs.rmSync(REPO, { recursive: true, force: true });
 console.log(fail ? `\n${fail} check(s) failed` : '\nall checks passed');
 process.exit(fail ? 1 : 0);

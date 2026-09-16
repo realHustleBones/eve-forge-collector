@@ -164,12 +164,21 @@ call it directly.
 | `/fills?type=&day=&from=&to=&conf=` | the reconstructed tape, row by row |
 | `/tape?type=&day=` | **volume by price + volume by hour, aggregated server-side** |
 | `/depth?type=&day=[&at=]` | ladders: the day's series, or the one in force at a moment |
-| `/series?type=&from=&to=` | top of book over time |
+| `/series?type=&from=&to=` | top of book over time, **across both archives** |
 | `/raw?set=fills\|depth&day=` | the whole day file, streamed as a download |
 
 ```bash
 curl "https://<app>.up.railway.app/tape?type=15614&day=2026-09-15"
 ```
+
+**Top of book lives in two places and `/series` reads both.** The Railway volume
+holds what this worker has collected, at 5-minute resolution, starting whenever
+it was first deployed. The repo's own `data/` directory ships inside the deploy
+(Railway builds from GitHub) and holds the hourly Actions archive going back to
+2026-08-06. Neither is a superset. Reading only the volume would silently throw
+away every day before the worker existed, which is most of the history — so both
+are read, merged in time order, and an identical timestamp is emitted once.
+The response says which sources it actually used.
 
 `/tape` is the one to reach for. It aggregates on the server, so drawing a
 volume-by-price histogram costs one small JSON response instead of pulling
@@ -228,7 +237,7 @@ node tools/validate-tape.mjs 2026-09-22                    # is the tape honest?
 npm test
 ```
 
-115 checks across six suites (9 + 13 + 23 + 18 + 30 + 22), all against a fake
+122 checks across six suites (9 + 13 + 23 + 18 + 37 + 22), all against a fake
 in-process ESI — no network.
 Pagination via `x-pages`, best-bid/ask reduction, the Jita filter, ladder merging
 and the level cap, delta encoding, retention and gzip, and the full fill-inference

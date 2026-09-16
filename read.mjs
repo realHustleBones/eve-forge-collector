@@ -26,6 +26,18 @@ import readline from 'node:readline';
 const MAX_ROWS = 50_000;
 const DEF_ROWS = 5_000;
 
+// Top of book lives in TWO places and neither is a superset of the other:
+//   <volume>/data  — what this worker has collected, 5-minute resolution,
+//                    starting whenever the worker was first deployed
+//   <repo>/data    — the hourly GitHub Actions archive, which ships inside the
+//                    deploy because Railway builds from the repo. Goes back to
+//                    2026-08-06, one sample an hour.
+// Reading only the volume silently throws away every day before the worker
+// existed, which is most of the history. So both get read and merged.
+// REPO_DIR exists so tests can point the second source somewhere controlled.
+// In production nothing sets it and it resolves to the deployed app directory.
+const REPO = process.env.REPO_DIR || import.meta.dirname;
+
 // A day file is plain .ndjson/.csv while the day is open and .gz once it closes.
 function dayFile(dir, day, ext) {
   for (const p of [path.join(dir, `${day}.${ext}`), path.join(dir, `${day}.${ext}.gz`)]) {
@@ -52,6 +64,19 @@ async function* records(file) {
     let o; try { o = JSON.parse(l); } catch { continue; }
     yield o;
   }
+}
+
+// Top-of-book days are nested under month directories, across every source.
+function tobDays(roots) {
+  const out = new Set();
+  for (const r of roots) {
+    if (!fs.existsSync(r)) continue;
+    for (const m of fs.readdirSync(r)) {
+      if (!/^\d{4}-\d{2}$/.test(m)) continue;
+      for (const d of daysIn(path.join(r, m), 'csv')) out.add(d);
+    }
+  }
+  return [...out].sort();
 }
 
 const daysIn = (dir, ext) => (fs.existsSync(dir)
@@ -149,25 +174,38 @@ async function getSeries(dirs, q) {
   const from = q.from || today(), to = q.to || today();
   const limit = Math.min(num(q.limit, DEF_ROWS), MAX_ROWS);
   const out = [];
-  const months = [...new Set([from.slice(0, 7), to.slice(0, 7)])];
-  const days = [];
-  for (const m of months) {
-    const dir = path.join(dirs.tob, m);
-    for (const d of daysIn(dir, 'csv')) if (d >= from && d <= to) days.push([dir, d]);
-  }
-  days.sort((a, b) => (a[1] < b[1] ? -1 : 1));
-  for (const [dir, d] of days) {
-    const f = dayFile(dir, d, 'csv');
-    if (!f) continue;
-    for await (const l of lines(f)) {
-      if (l.startsWith('timestamp,')) continue;
-      const [t, id, buy, sell] = l.split(',');
-      if (Number(id) !== type) continue;
-      out.push({ t, buy: buy === '' ? null : Number(buy), sell: sell === '' ? null : Number(sell) });
-      if (out.length >= limit) return { type, from, to, n: out.length, truncated: true, series: out };
+  const seen = new Set();
+  const hit = new Set();
+
+  for (const d of tobDays(dirs.tob).filter((x) => x >= from && x <= to)) {
+    // A single day can exist in BOTH sources at different sample rates — the
+    // repo's hourly row and the volume's 5-minute rows are both true. Merge
+    // them and order by time rather than picking a winner; a type has exactly
+    // one top of book at a given instant, so an identical timestamp is a
+    // duplicate and gets dropped.
+    const rows = [];
+    for (const rootDir of dirs.tob) {
+      const f = dayFile(path.join(rootDir, d.slice(0, 7)), d, 'csv');
+      if (!f) continue;
+      hit.add(rootDir === path.join(REPO, 'data') ? 'repo' : 'volume');
+      for await (const l of lines(f)) {
+        if (l.startsWith('timestamp,')) continue;
+        const [t, id, buy, sell] = l.split(',');
+        if (Number(id) !== type) continue;
+        rows.push({ t, buy: buy === '' ? null : Number(buy), sell: sell === '' ? null : Number(sell) });
+      }
+    }
+    rows.sort((a, b) => (a.t < b.t ? -1 : a.t > b.t ? 1 : 0));
+    for (const r of rows) {
+      if (seen.has(r.t)) continue;
+      seen.add(r.t);
+      out.push(r);
+      if (out.length >= limit) {
+        return { type, from, to, n: out.length, truncated: true, sources: [...hit], series: out };
+      }
     }
   }
-  return { type, from, to, n: out.length, truncated: false, series: out };
+  return { type, from, to, n: out.length, truncated: false, sources: [...hit], series: out };
 }
 
 // ---------------------------------------------------------------- the router
@@ -176,7 +214,8 @@ export function makeReader({ root }) {
   const dirs = {
     fills: path.join(root, 'fills'),
     depth: path.join(root, 'depth'),
-    tob: path.join(root, 'data'),
+    // De-duplicated, because in local dev the volume root IS the repo root.
+    tob: [...new Set([path.join(root, 'data'), path.join(REPO, 'data')])],
   };
   const token = process.env.READ_TOKEN || null;
 
@@ -195,11 +234,11 @@ export function makeReader({ root }) {
 
     try {
       if (p === '/days') {
-        const months = fs.existsSync(dirs.tob) ? fs.readdirSync(dirs.tob) : [];
         send(200, {
           fills: daysIn(dirs.fills, 'ndjson'),
           depth: daysIn(dirs.depth, 'ndjson'),
-          tob: months.flatMap((m) => daysIn(path.join(dirs.tob, m), 'csv')).sort(),
+          tob: tobDays(dirs.tob),
+          tobSources: dirs.tob,
         });
         return true;
       }
