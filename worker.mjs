@@ -54,7 +54,7 @@ const stats = { started: new Date().toISOString(), ticks: 0, lastTick: null, las
                 lastScan: null, skipped: 0, genLastModified: null, nextDelaySec: null,
                 exactLastTick: null, probableLastTick: null, topFillLastTick: null,
                 ambLastTick: null, frontLastTick: null, emptyLastTick: null,
-                cancelsLastTick: 0, repricesLastTick: 0, expiresLastTick: 0 };
+                cancelsLastTick: 0, repricesLastTick: 0, expiresLastTick: 0, replacesLastTick: 0 };
 
 // ---------------------------------------------------------------- ladders
 
@@ -261,12 +261,13 @@ async function tick() {
   stats.exactLastTick = ex; stats.probableLastTick = pr;
   stats.ambLastTick = amb; stats.frontLastTick = frt; stats.emptyLastTick = emp;
   stats.cancelsLastTick = cnt('cancel'); stats.repricesLastTick = cnt('reprice'); stats.expiresLastTick = cnt('expire');
+  stats.replacesLastTick = cnt('replace');
   stats.topFillLastTick = top ? { i: top.i, p: top.p, q: top.q, s: top.s, c: top.c, isk: top.p * top.q } : null;
   stats.fillsToday += all.n;
 
   log(`${pages}p ${book.size} orders · fills ${all.n} (${all.q.toLocaleString()}u, ${B(all.k)})` +
       ` [exact ${ex.n} ${B(ex.k)} · amb ${amb.n} ${B(amb.k)} · front ${frt.n} ${B(frt.k)} · empty ${emp.n} ${B(emp.k)}]` +
-      ` · cx ${cnt('cancel')} rp ${cnt('reprice')} xp ${cnt('expire')}` +
+      ` · cx ${cnt('cancel')} rp ${cnt('reprice')} rr ${cnt('replace')} xp ${cnt('expire')}` +
       (top ? ` · top ${top.i} ${top.q.toLocaleString()}@${top.p.toLocaleString()}=${B(top.p * top.q)}${top.c === 'exact' ? '' : '?'}` : '') +
       ` · depth ${drows.length} · tob ${trows.length}` +
       (zipped ? ` · gz ${zipped}` : '') + (pruned ? ` · pruned ${pruned}` : '') +

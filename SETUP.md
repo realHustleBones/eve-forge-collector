@@ -17,7 +17,7 @@ cd eve-forge-collector
 npm test
 ```
 
-All six suites must say `all checks passed` (122 checks). If they don't, stop and tell me — nothing
+All six suites must say `all checks passed` (130 checks). If they don't, stop and tell me — nothing
 below is worth doing against a broken collector.
 
 ```bash

@@ -182,5 +182,65 @@ const only = (ev, k) => ev.filter((e) => e.k === k);
     [only(ev, 'cancel').map((c) => c.p), only(ev, 'fill').length], [[170000], 0]);
 }
 
+// 13 — cancel-and-replace must not read as a sweep
+// Repricing keeps the order_id, so the differ already handles it. Pulling an
+// order and re-posting it does NOT: the old id vanishes from the front of the
+// book, which is identical to being swept. The tell is an identical order
+// appearing the same tick under a new id.
+{
+  const prev = mk([[1, 15614, 159900, 664, false], [9, 15614, 163500, 29, false]]);
+  const now  = mk([[2, 15614, 159900, 664, false], [9, 15614, 163500, 29, false]]);  // same order, new id
+  const ev = diff(prev, now, NOW);
+  check('an identical order reappearing is a replace, not a fill',
+    [only(ev, 'fill').length, only(ev, 'replace').length], [0, 1]);
+  check('...and the replace records what moved', only(ev, 'replace')[0],
+    { k: 'replace', i: 15614, p: 159900, q: 664, s: 'a' });
+}
+{
+  // the real one: 15,178,856 units of Noble Gas at 1.68, re-posted 2026-09-16
+  const prev = mk([[1, 2310, 1.68, 15178856, true], [9, 2310, 1.60, 500, true]]);
+  const now  = mk([[7, 2310, 1.68, 15178856, true], [9, 2310, 1.60, 500, true]]);
+  const ev = diff(prev, now, NOW);
+  check('the observed 15,178,856-unit Noble Gas phantom is caught',
+    [only(ev, 'fill').length, only(ev, 'replace')[0].q], [0, 15178856]);
+}
+{
+  // a DIFFERENT volume is a real change, not a re-post
+  const prev = mk([[1, 15614, 159900, 664, false], [9, 15614, 163500, 29, false]]);
+  const now  = mk([[2, 15614, 159900, 600, false], [9, 15614, 163500, 29, false]]);
+  check('a re-post at a different size is still treated as a fill',
+    only(diff(prev, now, NOW), 'fill').length, 1);
+}
+{
+  // A re-post at a DIFFERENT price is deliberately not matched — pairing on
+  // volume alone would be far too loose. The vanished order just falls through
+  // to the normal test, and here that lands on cancel rather than fill: an ask
+  // at 159,900 cannot have been swept when a 159,800 ask is still sitting
+  // there. Being conservative in both directions is the point.
+  const prev = mk([[1, 15614, 159900, 664, false], [9, 15614, 163500, 29, false]]);
+  const now  = mk([[2, 15614, 159800, 664, false], [9, 15614, 163500, 29, false]]);
+  const ev = diff(prev, now, NOW);
+  check('a re-post at a different price is not matched as a replace',
+    only(ev, 'replace').length, 0);
+  check('...and being behind the new touch makes it a cancel, not a fill',
+    [only(ev, 'fill').length, only(ev, 'cancel')[0].p], [0, 159900]);
+}
+{
+  // two identical orders vanish, only one replacement appears
+  const prev = mk([[1, 15614, 159900, 664, false], [2, 15614, 159900, 664, false], [9, 15614, 163500, 29, false]]);
+  const now  = mk([[3, 15614, 159900, 664, false], [9, 15614, 163500, 29, false]]);
+  const ev = diff(prev, now, NOW);
+  check('one replacement can only absorb one vanished order',
+    [only(ev, 'replace').length, only(ev, 'fill').length], [1, 1]);
+}
+{
+  // expiry is certain, so it still wins over the replace guess
+  const prev = mk([[1, 15614, 159900, 664, false, PAST]]);
+  const now  = mk([[2, 15614, 159900, 664, false]]);
+  const ev = diff(prev, now, NOW);
+  check('an expired order is an expire even if an identical one appears',
+    [only(ev, 'expire').length, only(ev, 'replace').length], [1, 0]);
+}
+
 console.log(fail ? `\n${fail} check(s) failed` : '\nall checks passed');
 process.exit(fail ? 1 : 0);

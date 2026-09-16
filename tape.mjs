@@ -8,6 +8,7 @@
 // Classification per order_id, prev -> now:
 //   volume_remain fell, id still there   -> FILL, exact price and size
 //   price changed, id still there        -> REPRICE (and a fill too, if volume fell)
+//   id gone, identical order appeared    -> REPLACE (cancel-and-re-post, not a trade)
 //   id gone, at or better than the new
 //     best price on its side             -> FILL, probable (it was at the front)
 //   id gone, behind the surviving touch  -> CANCEL, probable
@@ -149,11 +150,37 @@ export function touches(book) {
 export function diff(prev, now, nowTs) {
   const out = [];
   const tch = touches(now);
+
+  // CANCEL-AND-REPLACE looks exactly like a sweep, and it is not rare: anyone
+  // who pulls an order and re-posts it (rather than repricing, which keeps the
+  // order_id) makes their old id vanish from the front of the book. Observed in
+  // the wild as a phantom 15,178,856-unit "fill" that was one trader
+  // re-posting a single order.
+  //
+  // The tell is that the same order reappears the same tick under a NEW id with
+  // identical type, side, price and volume. Matching on all four makes an
+  // accidental collision very unlikely, and each new order is consumed once so
+  // two vanished orders cannot both claim the same replacement.
+  const key = (o) => `${o.t}|${o.b ? 1 : 0}|${o.p}|${o.v}`;
+  const fresh = new Map();
+  for (const [id, o] of now) {
+    if (prev.has(id)) continue;
+    const k = key(o);
+    fresh.set(k, (fresh.get(k) || 0) + 1);
+  }
+
   for (const [id, o] of prev) {
     const n = now.get(id);
 
     if (!n) {
       if (o.e && nowTs > o.e) { out.push({ k: 'expire', i: o.t, p: o.p, q: o.v, s: o.b ? 'b' : 'a' }); continue; }
+      // An identical order appeared this tick: the owner re-posted it. Not a trade.
+      const rk = key(o), avail = fresh.get(rk);
+      if (avail) {
+        fresh.set(rk, avail - 1);
+        out.push({ k: 'replace', i: o.t, p: o.p, q: o.v, s: o.b ? 'b' : 'a' });
+        continue;
+      }
       const t = tch.get(o.t);
       // Two very different reasons an order that vanished gets scored a fill,
       // and they do NOT deserve the same trust:
@@ -251,7 +278,7 @@ async function main() {
     `${pages}p · ${book.size} orders · gap ${((Date.parse(iso) - Date.parse(prev.ts)) / 60000).toFixed(1)}m · ` +
       `fills ${fills.length} (${exact.length} exact, ${fills.length - exact.length} probable) ` +
       `= ${fills.reduce((s, f) => s + f.q, 0).toLocaleString()} units / ${(isk / 1e9).toFixed(2)}B ISK · ` +
-      `reprice ${n('reprice')} · cancel ${n('cancel')} · expire ${n('expire')}` +
+      `reprice ${n('reprice')} · replace ${n('replace')} · cancel ${n('cancel')} · expire ${n('expire')}` +
       (zipped ? ` · gzipped ${zipped}` : '') + ` · ${((Date.now() - t0) / 1000).toFixed(1)}s`
   );
 }

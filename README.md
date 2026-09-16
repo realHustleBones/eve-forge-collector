@@ -102,6 +102,7 @@ order distinguishable from a hit one.
 |---|---|---|---|
 | `volume_remain` fell, id present | **fill** at that price, that size | exact | — |
 | price changed, id present | reprice (no fill) | — | — |
+| id gone, **identical order appeared** | replace (no fill) | — | — |
 | price changed AND volume fell | fill happened, price ambiguous | probable | `amb` |
 | id gone, ahead of a **live** touch | fill | probable | `front` |
 | id gone, **nothing left on that side** | fill, by default | probable | `empty` |
@@ -145,6 +146,23 @@ same generation).
 fills per type and divides by the volume ESI actually reports. Near 1.0 is
 healthy; systematically under means fills are being lost, over means cancels are
 being read as fills. Run it weekly.
+
+### Cancel-and-replace is not a sweep
+
+Repricing keeps the `order_id`, so the differ handles it. **Pulling an order and
+re-posting it does not** — the old id vanishes from the front of the book, which
+is indistinguishable from being swept. Caught in the wild on 2026-09-16 as a
+phantom **15,178,856-unit fill** of Noble Gas that was one trader re-posting a
+single order, tagged `probable/front` and worth a fictional 25.5M ISK.
+
+The tell is that the same order reappears in the same tick under a new id with
+identical type, side, price **and** volume. Matching on all four makes a chance
+collision very unlikely, and each replacement is consumed once so two vanished
+orders cannot both claim it. A re-post at a *different* price is deliberately
+not matched — pairing on volume alone would be far too loose.
+
+This is the failure mode `r: "front"` could never protect against, which is
+worth remembering before trusting any single large inferred fill.
 
 Two things bound the accuracy and no amount of engineering fixes them: ESI caches
 the book ~5 minutes, so anything that opens and closes inside one interval is
@@ -237,7 +255,7 @@ node tools/validate-tape.mjs 2026-09-22                    # is the tape honest?
 npm test
 ```
 
-122 checks across six suites (9 + 13 + 23 + 18 + 37 + 22), all against a fake
+130 checks across six suites (9 + 13 + 31 + 18 + 37 + 22), all against a fake
 in-process ESI — no network.
 Pagination via `x-pages`, best-bid/ask reduction, the Jita filter, ladder merging
 and the level cap, delta encoding, retention and gzip, and the full fill-inference
