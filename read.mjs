@@ -122,7 +122,11 @@ async function getTape(dirs, q) {
   const f = dayFile(dirs.fills, day, 'ndjson');
   if (!f) return { day, type, n: 0, note: 'no fills recorded for that day' };
 
-  const byPrice = new Map(), byHour = new Map(), conf = {};
+  // byPrice merges both resting sides, which is right for "where did this
+  // trade" and wrong for "who beat me". A seller hitting a bid below your ask
+  // never competed with your ask at all. bySide keeps the resting side so a
+  // caller can ask the second question without guessing.
+  const byPrice = new Map(), bySide = new Map(), byHour = new Map(), conf = {};
   let n = 0, units = 0, isk = 0, first = null, last = null;
   const side = { a: 0, b: 0 };
   for await (const r of records(f)) {
@@ -134,6 +138,10 @@ async function getTape(dirs, q) {
     conf[key] = (conf[key] || 0) + 1;
     const p = byPrice.get(r.p) || [0, 0, 0];
     p[0] += r.q; p[1] += r.p * r.q; p[2]++; byPrice.set(r.p, p);
+    // r.s is the side that was RESTING: 'a' = an ask was lifted, 'b' = a bid hit.
+    const sk = `${r.p}|${r.s}`;
+    const ps = bySide.get(sk) || [0, 0, 0];
+    ps[0] += r.q; ps[1] += r.p * r.q; ps[2]++; bySide.set(sk, ps);
     const h = r.t.slice(11, 13);
     const b = byHour.get(h) || [0, 0, 0];
     b[0] += r.q; b[1] += r.p * r.q; b[2]++; byHour.set(h, b);
@@ -144,6 +152,9 @@ async function getTape(dirs, q) {
     first, last, side, conf,
     byPrice: [...byPrice.entries()].sort((a, b) => a[0] - b[0])
       .map(([p, [q, k, c]]) => ({ price: p, units: q, isk: k, fills: c })),
+    byPriceSide: [...bySide.entries()]
+      .map(([k, [q, i, c]]) => { const [p, sd] = k.split('|'); return { price: Number(p), side: sd, units: q, isk: i, fills: c }; })
+      .sort((a, b) => a.price - b.price || (a.side < b.side ? -1 : 1)),
     byHour: [...byHour.entries()].sort()
       .map(([h, [q, k, c]]) => ({ hour: h, units: q, isk: k, fills: c })),
   };

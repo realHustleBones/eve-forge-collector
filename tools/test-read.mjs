@@ -128,6 +128,19 @@ try {
       { hour: '11', units: 10, isk: 1419000, fills: 1 },
     ]);
   check('/tape splits by resting side', t.side, { a: 175, b: 10 });
+  // A merged volume-by-price cannot answer "who beat me": it counts a seller
+  // hitting a bid below your ask as volume that passed your ask. byPriceSide
+  // keeps the resting side so that question can be asked honestly.
+  check('/tape splits volume by price AND resting side', t.byPriceSide, [
+    { price: 141900, side: 'b', units: 10, isk: 1419000, fills: 1 },
+    { price: 159900, side: 'a', units: 150, isk: 23985000, fills: 2 },
+    { price: 160000, side: 'a', units: 25, isk: 4000000, fills: 1 },
+  ]);
+  check('...so the 10 units under 159,900 are on the BID side and never passed an ask',
+    t.byPriceSide.filter((l) => l.side === 'a' && l.price < 159900).reduce((s, l) => s + l.units, 0), 0);
+  check('...while the merged view still totals the same',
+    t.byPriceSide.reduce((s, l) => s + l.units, 0), t.byPrice.reduce((s, l) => s + l.units, 0));
+
   check('/tape censuses confidence AND reason', t.conf, { exact: 3, 'probable:front': 1 });
   check('/tape reports the window it actually covered',
     [t.first, t.last], ['2026-09-15T10:00:00.000Z', '2026-09-15T11:00:00.000Z']);
