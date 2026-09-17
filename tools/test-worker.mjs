@@ -63,6 +63,7 @@ const esi = http.createServer((req, res) => {
 });
 
 const status = async (p) => (await fetch(`http://127.0.0.1:${p}/status`)).json();
+const get = async (p, route) => (await fetch(`http://127.0.0.1:${p}${route}`)).json();
 const health = async (p) => { const r = await fetch(`http://127.0.0.1:${p}/health`); return [r.status, await r.text()]; };
 const waitFor = async (fn, ms = 15000) => {
   const t0 = Date.now();
@@ -158,6 +159,60 @@ esi.listen(0, async () => {
     await sleep(300);
     check('...while a price move writes exactly the one type that moved',
       countLines(tobFile) - tobAtStop, 1);
+
+    // ---- closed days get compressed, top of book included
+    // The CSVs live under data/YYYY-MM/ and maintain() used to read only the two
+    // flat directories, so a volume's top-of-book was never zipped and never
+    // pruned: the one dataset kept forever was also the one kept at full size.
+    const YDAY = new Date(Date.parse(DAY) - 86400_000).toISOString().slice(0, 10);
+    const yTob = path.join(ROOT, 'data', YDAY.slice(0, 7), `${YDAY}.csv`);
+    const yFills = path.join(ROOT, 'fills', `${YDAY}.ndjson`);
+    fs.mkdirSync(path.dirname(yTob), { recursive: true });
+    fs.mkdirSync(path.dirname(yFills), { recursive: true });
+    fs.writeFileSync(yTob, 'timestamp,type_id,best_buy,best_sell\n'
+      + `${YDAY}T12:00:00.000Z,28699,88200,94900\n`);
+    fs.writeFileSync(yFills, JSON.stringify(
+      { t: `${YDAY}T12:00:00.000Z`, i: 28699, p: 94880, q: 3678, s: 'a', c: 'exact' }) + '\n');
+
+    book = [ord(1, 15614, 159700, 6, false), ord(2, 15614, 163500, 29, false), ord(3, 28699, 92600, 90, true)];
+    stamp = 14;
+    await waitFor(async () => (fs.existsSync(`${yTob}.gz`) ? true : null));
+    check('a closed top-of-book day gets compressed', fs.existsSync(yTob), false);
+    check('...and so does a closed fills day',
+      [fs.existsSync(`${yFills}.gz`), fs.existsSync(yFills)], [true, false]);
+    check("...and today's open file is left alone", fs.existsSync(tobFile), true);
+    // The reader merges the volume with the repo's own shipped data/, which has
+    // real rows for this day too, so look for OUR row rather than the first one.
+    const zipped = await get(port, `/series?type=28699&from=${YDAY}&to=${YDAY}`);
+    const afterZip = (await status(port)).lastScan;
+    check('...and the reader still serves the day it just zipped',
+      zipped.series?.some((r) => r.t === `${YDAY}T12:00:00.000Z` && r.sell === 94900), true);
+
+    // ---- depth is kept forever
+    // An ancient depth day is the whole test: under the old rolling window this
+    // file was deleted on the first tick that saw it, silently and for good.
+    const OLD = '2020-01-01';
+    const oldDepth = path.join(ROOT, 'depth', `${OLD}.ndjson.gz`);
+    fs.writeFileSync(oldDepth, zlib.gzipSync(JSON.stringify(
+      { t: `${OLD}T00:00:00.000Z`, i: 28699, b: [[1, 1, 1]], a: [[2, 1, 1]] }) + '\n'));
+    book = [ord(1, 15614, 159600, 6, false), ord(2, 15614, 163500, 29, false), ord(3, 28699, 92700, 90, true)];
+    stamp = 15;
+    await waitFor(async () => ((await status(port)).lastScan > afterZip ? true : null));
+    check('a depth day from years ago is still there after a tick', fs.existsSync(oldDepth), true);
+
+    // ---- the volume is measured, not guessed
+    const disk = (await status(port)).disk;
+    check('status reports bytes per dataset',
+      [typeof disk.fills.mb, typeof disk.depth.mb, typeof disk.tob.mb],
+      ['number', 'number', 'number']);
+    check('...and how big the volume actually is', disk.volumeGB > 0, true);
+    check('...and which sets are never pruned, so growth is attributable',
+      [disk.fills.retainDays, disk.tob.retainDays], [null, null]);
+    check('...and a closed day gives a measured per-day rate', disk.tob.mbPerDay !== null, true);
+    check('...and reports depth as kept for good, not on a window',
+      [disk.retainDepthDays, disk.depth.retainDays], [null, null]);
+    check('...and counts depth against free space, since it no longer plateaus',
+      disk.note.includes('nothing is pruned'), true);
 
     // ---- a state file from before `gen` existed must still load
     await stop();

@@ -28,7 +28,10 @@ const CONCURRENCY = Number(process.env.CONCURRENCY || 12);
 const DEPTH_DIR = process.env.DEPTH_DIR || 'depth';
 const UNIVERSE = process.env.UNIVERSE_FILE || 'universe.json';
 const LEVELS = Number(process.env.LEVELS || 25);      // per side, like ESI's own cap
-const RETAIN_DAYS = Number(process.env.RETAIN_DAYS || 90);
+// Same rule as worker.mjs: unset / 0 / "forever" keeps everything.
+const RETAIN_RAW = String(process.env.RETAIN_DAYS ?? '').trim().toLowerCase();
+const RETAIN_DAYS = (RETAIN_RAW === '' || RETAIN_RAW === 'forever' || RETAIN_RAW === 'never')
+  ? 0 : (Number(RETAIN_RAW) > 0 ? Number(RETAIN_RAW) : 0);
 const RETRIES = 4;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -112,13 +115,15 @@ function lastHashes(day, yesterday) {
 
 function maintain(today) {
   if (!fs.existsSync(DEPTH_DIR)) return { zipped: 0, pruned: 0 };
-  const cutoff = new Date(Date.parse(today) - RETAIN_DAYS * 86400_000).toISOString().slice(0, 10);
+  const cutoff = RETAIN_DAYS > 0
+    ? new Date(Date.parse(today) - RETAIN_DAYS * 86400_000).toISOString().slice(0, 10)
+    : null;
   let zipped = 0, pruned = 0;
   for (const f of fs.readdirSync(DEPTH_DIR)) {
     const day = f.slice(0, 10);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) continue;
     const full = path.join(DEPTH_DIR, f);
-    if (day < cutoff) { fs.unlinkSync(full); pruned++; continue; }
+    if (cutoff && day < cutoff) { fs.unlinkSync(full); pruned++; continue; }
     if (f.endsWith('.ndjson') && day < today) {
       fs.writeFileSync(full + '.gz', zlib.gzipSync(fs.readFileSync(full), { level: 9 }));
       fs.unlinkSync(full);

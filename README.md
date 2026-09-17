@@ -5,7 +5,7 @@ Three collectors over one data source, plus the tools to read them back.
 | tier | script | cadence | host | keeps |
 |---|---|---|---|---|
 | 1 | `collect.mjs` | hourly | GitHub Actions | best bid / ask, every Forge item, forever |
-| 2 | `depth.mjs` | 5 min | persistent | 25 ladder levels a side, liquid universe, 90 days |
+| 2 | `depth.mjs` | 5 min | persistent | 25 ladder levels a side, liquid universe, forever |
 | 3 | `tape.mjs` | 5 min | persistent | inferred fills — price, size, side — forever |
 
 `universe.mjs` (weekly) decides who is liquid enough for tiers 2 and 3.
@@ -25,10 +25,14 @@ can resume.
    sets the start command and health check.
 2. **Attach a volume mounted at `/data`.** Without one the filesystem is
    ephemeral and every restart loses the state file, which means a cold start and
-   a gap in the tape. 5 GB (Hobby) is ample — about 0.85 GB after a year.
+   a gap in the tape. Nothing is pruned any more, so the volume has to be sized
+   against real growth rather than a guess: `GET /status` reports a `disk` block
+   with measured MB/day per dataset, the volume's true size from `statfs`, and
+   `daysUntilFull`. Read it after a few closed days and resize from there —
+   Railway grows a volume live but will not shrink one.
 3. Set `ESI_UA` to a contact string. Optionally `INTERVAL_SEC` (fallback only —
-   see below), `TICK_PAD_SEC` (default 5) and `RETAIN_DAYS` (default 90, depth
-   only — fills are kept forever).
+   see below), `TICK_PAD_SEC` (default 5) and `RETAIN_DAYS` (unset = forever;
+   set a positive number to roll depth off after that many days).
 4. `GET /health` returns 200 while **scans** are landing, 503 if the last one is
    older than 3 intervals. Scans, not ticks: a run of generations where nothing
    changed is a healthy worker being cheap, and judging it on ticks would kill a
@@ -215,7 +219,7 @@ serving is the same one holding a 330k-order book.
 
 ```
 data/YYYY-MM/YYYY-MM-DD.csv(.gz)   top of book, every item, forever
-depth/YYYY-MM-DD.ndjson(.gz)       25 ladder levels a side, rolling RETAIN_DAYS
+depth/YYYY-MM-DD.ndjson(.gz)       25 ladder levels a side, forever
 fills/YYYY-MM-DD.ndjson(.gz)       the inferred tape, forever
 state/book.json.gz                 last snapshot + generation stamp, so a
                                    restart resumes without re-reading the book

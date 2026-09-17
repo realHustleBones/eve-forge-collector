@@ -26,7 +26,13 @@ import { makeReader } from './read.mjs';
 const ROOT = process.env.DATA_ROOT || process.env.RAILWAY_VOLUME_MOUNT_PATH || '/data';
 const INTERVAL = Number(process.env.INTERVAL_SEC || 300) * 1000;
 const LEVELS = Number(process.env.LEVELS || 25);
-const RETAIN_DEPTH = Number(process.env.RETAIN_DAYS || 90);
+// Depth retention. Unset, 0, or "forever" keeps every ladder for good; a
+// positive number is a rolling window in days. A negative or unparseable value
+// means forever too — deleting the archive is not a sane reading of a typo.
+const RETAIN_RAW = String(process.env.RETAIN_DAYS ?? '').trim().toLowerCase();
+const RETAIN_DEPTH = (RETAIN_RAW === '' || RETAIN_RAW === 'forever' || RETAIN_RAW === 'never')
+  ? 0 : (Number(RETAIN_RAW) > 0 ? Number(RETAIN_RAW) : 0);
+const PRUNE_DEPTH = RETAIN_DEPTH > 0;
 const PORT = Number(process.env.PORT || 3000);
 // How long after a generation expires to go looking for the next one. A couple
 // of seconds of slack absorbs CDN jitter without polling early, which CCP
@@ -131,23 +137,102 @@ function seedDeltaCaches(book) {
   for (const [t, v] of topOfBook(book)) tobLast.set(t, `${v.b ?? ''},${v.a ?? ''}`);
 }
 
+// Day files sit flat in fills/ and depth/ but under a YYYY-MM directory in
+// data/. Walking instead of a flat readdir is what lets maintain() reach the
+// top-of-book CSVs at all.
+function* dayFiles(dir) {
+  if (!fs.existsSync(dir)) return;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) { yield* dayFiles(full); continue; }
+    if (/^\d{4}-\d{2}-\d{2}[.]/.test(e.name)) yield full;
+  }
+}
+
 function maintain(today) {
   let zipped = 0, pruned = 0;
-  const cutoff = new Date(Date.parse(today) - RETAIN_DEPTH * 86400_000).toISOString().slice(0, 10);
-  for (const [dir, retain] of [[FILLS, null], [DEPTH, cutoff]]) {
-    if (!fs.existsSync(dir)) continue;
-    for (const f of fs.readdirSync(dir)) {
-      const d = f.slice(0, 10);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
-      const full = path.join(dir, f);
+  // A null cutoff is the whole point of PRUNE_DEPTH being off: the loop below
+  // already treats null as "keep everything", so forever needs no special case.
+  const cutoff = PRUNE_DEPTH
+    ? new Date(Date.parse(today) - RETAIN_DEPTH * 86400_000).toISOString().slice(0, 10)
+    : null;
+  // [dir, extension, prune-before]. Top-of-book used to be missing from this
+  // list, so every CSV on the volume stayed uncompressed for good — about five
+  // times the bytes it needs, on the one dataset that is never pruned. The
+  // reader already opens .csv and .csv.gz interchangeably, so zipping a closed
+  // day is invisible to every endpoint.
+  for (const [dir, ext, retain] of [[FILLS, 'ndjson', null],
+                                    [DEPTH, 'ndjson', cutoff],
+                                    [TOB,   'csv',    null]]) {
+    for (const full of dayFiles(dir)) {
+      const f = path.basename(full), d = f.slice(0, 10);
       if (retain && d < retain) { fs.unlinkSync(full); pruned++; continue; }
-      if (f.endsWith('.ndjson') && d < today) {
+      // Only ever zip a day that has closed: the open day is still being
+      // appended to, and a .gz beside a live .csv would hide the live one.
+      if (f.endsWith(`.${ext}`) && d < today) {
         fs.writeFileSync(full + '.gz', zlib.gzipSync(fs.readFileSync(full), { level: 9 }));
         fs.unlinkSync(full); zipped++;
       }
     }
   }
   return { zipped, pruned };
+}
+
+// How much room is left, measured rather than guessed. Railway does not put the
+// volume size in the environment, so statfs on the mount point is the only
+// honest source; a wrong guess here is worse than no number at all.
+function dayBytes(dir) {
+  const per = new Map();
+  for (const full of dayFiles(dir)) {
+    const d = path.basename(full).slice(0, 10);
+    try { per.set(d, (per.get(d) || 0) + fs.statSync(full).size); } catch { /* raced maintain */ }
+  }
+  return per;
+}
+
+function diskReport(today) {
+  const out = { retainDepthDays: PRUNE_DEPTH ? RETAIN_DEPTH : null };
+  let used = 0;
+  for (const [k, dir, retain] of [['fills', FILLS, null],
+                                  ['depth', DEPTH, PRUNE_DEPTH ? RETAIN_DEPTH : null],
+                                  ['tob',   TOB,   null]]) {
+    const per = dayBytes(dir);
+    const days = [...per.keys()].sort();
+    const bytes = [...per.values()].reduce((a, b) => a + b, 0);
+    used += bytes;
+    // Median of the CLOSED days only: today is a part-day and the open file is
+    // not yet compressed, so including it would overstate the daily rate.
+    const closed = days.filter((d) => d < today).map((d) => per.get(d)).sort((a, b) => a - b);
+    out[k] = {
+      mb: +(bytes / 1e6).toFixed(1), days: days.length,
+      from: days[0] ?? null, to: days[days.length - 1] ?? null,
+      mbPerDay: closed.length ? +(closed[closed.length >> 1] / 1e6).toFixed(2) : null,
+      retainDays: retain,
+    };
+  }
+  out.usedMB = +(used / 1e6).toFixed(1);
+  try {
+    const st = fs.statfsSync(ROOT);
+    const total = st.blocks * st.bsize, free = st.bavail * st.bsize;
+    out.volumeGB = +(total / 1e9).toFixed(2);
+    out.freeGB = +(free / 1e9).toFixed(2);
+    out.usedPct = total ? +((1 - free / total) * 100).toFixed(1) : null;
+    // With retention off every set grows without a ceiling, and depth is much
+    // the largest of the three — so it has to be charged against free space day
+    // on day, not treated as something that plateaus.
+    const grow = ((out.fills.mbPerDay || 0) + (out.tob.mbPerDay || 0)
+                  + (PRUNE_DEPTH ? 0 : (out.depth.mbPerDay || 0))) * 1e6;
+    // While a window IS set, depth stops taking new ground once it fills, but
+    // until then it is still claiming some — charge that remainder up front.
+    const depthLeft = PRUNE_DEPTH
+      ? (out.depth.mbPerDay || 0) * 1e6 * Math.max(0, RETAIN_DEPTH - out.depth.days)
+      : 0;
+    if (grow > 0) out.daysUntilFull = Math.max(0, Math.round((free - depthLeft) / grow));
+    out.note = PRUNE_DEPTH
+      ? `depth rolls off at ${RETAIN_DEPTH} days; fills and top-of-book are never pruned`
+      : 'nothing is pruned — every dataset is kept for good';
+  } catch { out.volumeGB = null; out.note = 'statfs unavailable — volume size unknown'; }
+  return out;
 }
 
 function loadUniverse() {
@@ -226,6 +311,7 @@ async function tick() {
   prev = { ts: iso, book };
   saveState(iso, book, gen);
   const { zipped, pruned } = maintain(d);
+  stats.disk = diskReport(d);
 
   // The tape's honesty lives entirely in the exact/probable split.
   //   exact    = volume_remain fell on a surviving order_id. That is an

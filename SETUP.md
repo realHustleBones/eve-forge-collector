@@ -86,8 +86,13 @@ means a hole in the tape every time Railway so much as reschedules the container
 1. In the project canvas press **⌘K** (Ctrl+K on Windows) → **New Volume**
    → pick the `eve-forge-collector` service.
 2. Set the **mount path** to `/data`.
-3. Size: **5 GB** is ample. Actual usage lands around 0.85 GB after a full year —
-   fills kept forever, depth on a rolling 90 days.
+3. Size: start at **5 GB** (the Hobby default) and let the collector tell you.
+   Nothing is pruned — tape, depth and top of book are all kept for good — so
+   how long that lasts depends entirely on how much depth costs per day, which
+   is a measurement, not a guess. After two or three closed days, `GET /status`
+   returns a `disk` block: MB and MB/day per dataset, the volume's real size,
+   and `daysUntilFull`. Size from that. Railway resizes a volume up live, but
+   never down, so there is no penalty for starting small and growing.
 
 Adding the volume restarts the service. Railway also injects
 `RAILWAY_VOLUME_MOUNT_PATH`, which the worker falls back to, so `/data` works
@@ -103,7 +108,7 @@ either way.
 | `INTERVAL_SEC` | `300` | optional **fallback**. The real schedule comes from ESI's `Expires` header |
 | `TICK_PAD_SEC` | `5` | optional. Slack added after a generation expires, to absorb CDN jitter without polling early |
 | `READ_TOKEN` | a random string | optional but recommended. Makes every read endpoint require `?k=<token>`; `/health` and `/status` stay open |
-| `RETAIN_DAYS` | `90` | optional. Depth retention only — fills are never pruned |
+| `RETAIN_DAYS` | unset | optional. Leave unset (or `forever`) to keep depth for good. A positive number rolls depth off after that many days; fills and top of book are never pruned either way |
 
 Do **not** set `PORT`. Railway injects it and the worker binds to it.
 
