@@ -40,14 +40,26 @@ const RETRIES = 4;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.error(`[${new Date().toISOString()}]`, ...a);
 
+// Node's fetch reports every transport failure as the same opaque
+// "fetch failed"; the real reason is buried in e.cause. Losing it is how a
+// whole GitHub run came back as "FATAL page 1 failed: HTTP 0" with nothing to
+// diagnose. cause.code is the useful part: ECONNRESET, ETIMEDOUT, ENOTFOUND.
+const why = (e) => [e?.cause?.code, e?.cause?.message, e?.message]
+  .filter(Boolean).join(' \u00b7 ') || String(e);
+
+// fetch has no default timeout, so a half-open socket can hold a run open for
+// minutes and still end with no explanation. Fail fast and say why.
+const TIMEOUT = Number(process.env.ESI_TIMEOUT_SEC || 30) * 1000;
+
 let errorBudgetPause = 0;
 
 async function getPage(page) {
   const url = `${ESI}/markets/${FORGE}/orders/?order_type=all&page=${page}`;
+  let lastError = null;
   for (let attempt = 0; attempt < RETRIES; attempt++) {
     if (errorBudgetPause > Date.now()) await sleep(errorBudgetPause - Date.now());
     try {
-      const r = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': UA } });
+      const r = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': UA }, signal: AbortSignal.timeout(TIMEOUT) });
       // Number(null) === 0 — an absent header must be checked explicitly.
       const raw = r.headers.get('x-esi-error-limit-remain');
       const remain = raw === null ? NaN : Number(raw);
@@ -67,9 +79,13 @@ async function getPage(page) {
         expires: r.headers.get('expires'),
         date: r.headers.get('date'),
       };
-    } catch { await sleep(1000 * 2 ** attempt); }
+    } catch (e) {
+      lastError = why(e);
+      log(`page ${page} attempt ${attempt + 1}/${RETRIES} threw: ${lastError}`);
+      await sleep(1000 * 2 ** attempt);
+    }
   }
-  return { ok: false, status: 0, page };
+  return { ok: false, status: 0, page, error: lastError };
 }
 
 // Read the generation stamp + time-to-live off a page response.
@@ -95,7 +111,7 @@ export function planNext(gen, { interval, pad = 5000, min = 15_000 } = {}) {
 // unchanged book costs ONE page instead of all 411.
 export async function snapshot(prevGen = null) {
   const first = await getPage(1);
-  if (!first.ok) throw new Error(`page 1 failed: HTTP ${first.status}`);
+  if (!first.ok) throw new Error(`page 1 failed: HTTP ${first.status}${first.error ? ` \u2014 ${first.error}` : ''}`);
   const gen = genOf(first);
 
   // ESI stamps Last-Modified with when the GENERATION was cached, and keeps it
@@ -125,7 +141,7 @@ export async function snapshot(prevGen = null) {
     while (next <= pages) {
       const p = next++;
       const r = await getPage(p);
-      if (r.ok) take(r.body); else { failed++; log(`page ${p} failed: HTTP ${r.status}`); }
+      if (r.ok) take(r.body); else { failed++; log(`page ${p} failed: HTTP ${r.status}${r.error ? ` \u2014 ${r.error}` : ''}`); }
     }
   }));
   if (failed > Math.max(3, pages * 0.05)) {

@@ -26,14 +26,26 @@ const log = (...a) => console.error(`[${new Date().toISOString()}]`, ...a);
 
 // ---------------------------------------------------------------- ESI fetch
 
+// Node's fetch reports every transport failure as the same opaque
+// "fetch failed"; the real reason is buried in e.cause. Losing it is how a
+// whole GitHub run came back as "FATAL page 1 failed: HTTP 0" with nothing to
+// diagnose. cause.code is the useful part: ECONNRESET, ETIMEDOUT, ENOTFOUND.
+const why = (e) => [e?.cause?.code, e?.cause?.message, e?.message]
+  .filter(Boolean).join(' \u00b7 ') || String(e);
+
+// fetch has no default timeout, so a half-open socket can hold a run open for
+// minutes and still end with no explanation. Fail fast and say why.
+const TIMEOUT = Number(process.env.ESI_TIMEOUT_SEC || 30) * 1000;
+
 let errorBudgetPause = 0;
 
 async function getPage(page) {
   const url = `${ESI}/markets/${FORGE}/orders/?order_type=all&page=${page}`;
+  let lastError = null;
   for (let attempt = 0; attempt < RETRIES; attempt++) {
     if (errorBudgetPause > Date.now()) await sleep(errorBudgetPause - Date.now());
     try {
-      const r = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': UA } });
+      const r = await fetch(url, { headers: { Accept: 'application/json', 'User-Agent': UA }, signal: AbortSignal.timeout(TIMEOUT) });
 
       // ESI error budget: back off hard rather than get the IP banned.
       // NB: Number(null) === 0, so an ABSENT header must be checked for
@@ -58,10 +70,12 @@ async function getPage(page) {
         pages: Number(r.headers.get('x-pages') || 1),
       };
     } catch (e) {
+      lastError = why(e);
+      log(`page ${page} attempt ${attempt + 1}/${RETRIES} threw: ${lastError}`);
       await sleep(1000 * 2 ** attempt);
     }
   }
-  return { ok: false, status: 0, page };
+  return { ok: false, status: 0, page, error: lastError };
 }
 
 // Reduce a page of orders into the running best bid / best ask map.
@@ -80,7 +94,7 @@ function absorb(best, orders) {
 
 async function scanForge() {
   const first = await getPage(1);
-  if (!first.ok) throw new Error(`page 1 failed: HTTP ${first.status}`);
+  if (!first.ok) throw new Error(`page 1 failed: HTTP ${first.status}${first.error ? ` \u2014 ${first.error}` : ''}`);
 
   const best = new Map();
   absorb(best, first.body);
@@ -97,7 +111,7 @@ async function scanForge() {
         if (res.ok) absorb(best, res.body);
         else {
           failed++;
-          log(`page ${p} failed: HTTP ${res.status}`);
+          log(`page ${p} failed: HTTP ${res.status}${res.error ? ` \u2014 ${res.error}` : ''}`);
         }
       }
     })

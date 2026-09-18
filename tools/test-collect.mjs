@@ -57,7 +57,13 @@ const reset = () => {
 };
 reset();
 
+// When true the fake ESI kills the socket instead of answering, which is what
+// a transport failure looks like from Node's fetch: it throws, and the reason
+// only exists on e.cause.
+let killSockets = false;
+
 const server = http.createServer((req, res) => {
+  if (killSockets) { req.destroy(); return; }
   const page = Number(new URL(req.url, 'http://x').searchParams.get('page') || 1);
   const pages = Math.max(1, Math.ceil(orders.length / PER_PAGE));
   const slice = orders.slice((page - 1) * PER_PAGE, page * PER_PAGE);
@@ -87,6 +93,21 @@ server.listen(0, async () => {
       encoding: 'utf8',
     });
   const today = new Date().toISOString().slice(0, 10);
+
+  // ---- a dropped connection must say WHY, not just "HTTP 0"
+  // A whole GitHub Actions run died on `FATAL page 1 failed: HTTP 0` with the
+  // cause swallowed by a bare catch. The status is not the diagnosis.
+  killSockets = true;
+  // execFile repeats stderr inside e.message, so count attempts on stderr alone.
+  let dropped = null, droppedErr = '';
+  try { await run(); } catch (e) { droppedErr = e.stderr || ''; dropped = `${droppedErr}${e.message}`; }
+  killSockets = false;
+  check('a dropped connection fails the run', dropped !== null, true);
+  check('...and the FATAL line carries the transport error, not a bare HTTP 0',
+    /page 1 failed: HTTP 0 \u2014 \S/.test(dropped || ''), true);
+  check('...naming the socket-level cause', /ECONNRESET|ECONNREFUSED|UND_ERR|socket/i.test(dropped || ''), true);
+  check('...and each attempt is logged, so a flap is distinguishable from a hard outage',
+    (droppedErr.match(/attempt \d+\/\d+ threw/g) || []).length, 4);
 
   // ---- run 1: everything is new
   await run();
