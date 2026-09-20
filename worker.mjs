@@ -414,7 +414,7 @@ const ENDPOINTS = {
   '/tape': '?type=&day= — volume by price and volume by hour, aggregated',
   '/depth': '?type=&day=[&at=] — ladders: the whole day, or the one nearest a time',
   '/series': '?type=&from=&to= — top of book over time',
-  '/raw': '?set=fills|depth&day= — the whole day file, streamed',
+  '/raw': '?set=fills|depth|tob&day= — the whole day file, streamed',
 };
 
 http.createServer(async (req, res) => {

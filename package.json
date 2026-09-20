@@ -1,7 +1,7 @@
 {
   "name": "eve-forge-collector",
   "version": "2.0.0",
-  "description": "Hourly best bid/ask for every item trading at Jita 4-4, collected from public ESI",
+  "description": "5-minute best bid/ask, ladders and an inferred trade tape for every item at Jita 4-4, from public ESI",
   "type": "module",
   "private": true,
   "scripts": {
@@ -11,7 +11,8 @@
     "tape": "node tape.mjs",
     "universe": "node universe.mjs",
     "series": "node tools/series.mjs",
-    "test": "node tools/test-collect.mjs && node tools/test-depth.mjs && node tools/test-tape.mjs && node tools/test-gen.mjs && node tools/test-read.mjs && node tools/test-worker.mjs"
+    "test": "node tools/test-collect.mjs && node tools/test-depth.mjs && node tools/test-tape.mjs && node tools/test-gen.mjs && node tools/test-read.mjs && node tools/test-worker.mjs && node tools/test-archive.mjs",
+    "archive": "node tools/archive-tob.mjs"
   },
   "engines": {
     "node": ">=20"

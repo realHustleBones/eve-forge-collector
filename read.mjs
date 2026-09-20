@@ -9,7 +9,8 @@
 //   GET /tape?type=&day=              volume by price + volume by hour
 //   GET /depth?type=&day=[&at=]       ladders: nearest one, or the day's series
 //   GET /series?type=&from=&to=       top of book over time
-//   GET /raw?set=fills&day=           the whole day file, streamed
+//                        [&src=both]  also merge the hourly repo archive in
+//   GET /raw?set=fills|depth|tob&day= the whole day file, streamed
 //
 // Set READ_TOKEN to require ?k=<token> on every one of these. /health and
 // /status stay open so Railway's healthcheck keeps working.
@@ -188,14 +189,23 @@ async function getSeries(dirs, q) {
   const seen = new Set();
   const hit = new Set();
 
+  // Both sources can hold the same day at different sample rates. Merging them
+  // reads as harmless and is not: each source is delta-encoded against ITSELF,
+  // so a sparse hourly row can restate a value the 5-minute record has already
+  // moved past. Sorted into one series that appears as a price moving away and
+  // back — a quote change that never happened. Anything counting quote moves
+  // sees those as real. Where the volume covers a day it is a strict superset
+  // of the hourly record, so prefer it outright and fall back to the repo only
+  // for days before the worker existed.
+  // CAVEAT: on the first day the worker ran, its coverage starts mid-day and
+  // the repo still holds the earlier hours. Pass ?src=both for that one day, or
+  // any time you want the old merge back.
+  const merge = q.src === 'both';
   for (const d of tobDays(dirs.tob).filter((x) => x >= from && x <= to)) {
-    // A single day can exist in BOTH sources at different sample rates — the
-    // repo's hourly row and the volume's 5-minute rows are both true. Merge
-    // them and order by time rather than picking a winner; a type has exactly
-    // one top of book at a given instant, so an identical timestamp is a
-    // duplicate and gets dropped.
+    const present = dirs.tob.filter((rootDir) => dayFile(path.join(rootDir, d.slice(0, 7)), d, 'csv'));
+    const use = merge ? present : present.slice(0, 1);   // dirs.tob is volume-first
     const rows = [];
-    for (const rootDir of dirs.tob) {
+    for (const rootDir of use) {
       const f = dayFile(path.join(rootDir, d.slice(0, 7)), d, 'csv');
       if (!f) continue;
       hit.add(rootDir === path.join(REPO, 'data') ? 'repo' : 'volume');
@@ -257,13 +267,22 @@ export function makeReader({ root }) {
       if (p === '/raw') {
         const set = q.set || 'fills';
         const day = q.day || today();
-        const spec = { fills: [dirs.fills, 'ndjson'], depth: [dirs.depth, 'ndjson'] }[set];
-        if (!spec) { send(400, { error: 'set must be fills or depth' }); return true; }
-        const f = dayFile(spec[0], day, spec[1]);
+        if (!['fills', 'depth', 'tob'].includes(set)) {
+          send(400, { error: 'set must be fills, depth or tob' }); return true;
+        }
+        // tob is the odd one out: CSV, nested under a YYYY-MM directory, and
+        // present in two roots. An archiver pulling this wants the VOLUME's
+        // 5-minute copy, never the repo's hourly one (which is what it is about
+        // to write back), so resolve against dirs.tob[0] only — it is
+        // volume-first by construction in makeReader.
+        const [dir, ext] = set === 'tob'
+          ? [path.join(dirs.tob[0], day.slice(0, 7)), 'csv']
+          : [set === 'fills' ? dirs.fills : dirs.depth, 'ndjson'];
+        const f = dayFile(dir, day, ext);
         if (!f) { send(404, { error: `no ${set} for ${day}` }); return true; }
         res.writeHead(200, {
-          'Content-Type': 'application/x-ndjson',
-          'Content-Disposition': `attachment; filename="${set}-${day}.ndjson${f.endsWith('.gz') ? '.gz' : ''}"`,
+          'Content-Type': ext === 'csv' ? 'text/csv' : 'application/x-ndjson',
+          'Content-Disposition': `attachment; filename="${set}-${day}.${ext}${f.endsWith('.gz') ? '.gz' : ''}"`,
           'Access-Control-Allow-Origin': '*',
         });
         fs.createReadStream(f).pipe(res);   // streamed, never buffered

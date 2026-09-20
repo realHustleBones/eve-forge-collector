@@ -4,13 +4,25 @@ Three collectors over one data source, plus the tools to read them back.
 
 | tier | script | cadence | host | keeps |
 |---|---|---|---|---|
-| 1 | `collect.mjs` | hourly | GitHub Actions | best bid / ask, every Forge item, forever |
+| 1 | `worker.mjs` | 5 min | persistent | best bid / ask, every Forge item, forever |
 | 2 | `depth.mjs` | 5 min | persistent | 25 ladder levels a side, liquid universe, forever |
 | 3 | `tape.mjs` | 5 min | persistent | inferred fills — price, size, side — forever |
 
 `universe.mjs` (weekly) decides who is liquid enough for tiers 2 and 3.
+Tier 1 has **no** universe filter: `topOfBook()` covers every item in the book,
+where `laddersFrom()` does not.
 All three make the same pass over `/markets/10000002/orders/` — 410-411 pages as
 of September 2026 — and differ only in what they keep.
+
+**GitHub Actions no longer collects.** It used to run `collect.mjs` hourly as an
+independent tier 1, and both halves of that turned out to be false. It was not
+hourly: GitHub throttles scheduled workflows hard, and it was landing 5 to 7
+times a day with 3 to 9 hour holes. And it was not independent data: the worker
+already writes the same rows for the same items 58x more often, off the same
+scan, for no extra ESI requests. So the Action's job is now to **archive** — it
+pulls the worker's day files and commits them (`tools/archive-tob.mjs`), which is
+what keeps the Railway volume from being the only live copy. `collect.mjs` stays
+in the tree as a standalone scanner for bootstrapping or disaster recovery.
 
 ## Running it on Railway
 
@@ -193,14 +205,24 @@ call it directly.
 curl "https://<app>.up.railway.app/tape?type=15614&day=2026-09-15"
 ```
 
-**Top of book lives in two places and `/series` reads both.** The Railway volume
-holds what this worker has collected, at 5-minute resolution, starting whenever
-it was first deployed. The repo's own `data/` directory ships inside the deploy
-(Railway builds from GitHub) and holds the hourly Actions archive going back to
-2026-08-06. Neither is a superset. Reading only the volume would silently throw
-away every day before the worker existed, which is most of the history — so both
-are read, merged in time order, and an identical timestamp is emitted once.
-The response says which sources it actually used.
+**Top of book lives in two places and `/series` prefers the volume.** The Railway
+volume holds what this worker has collected, at 5-minute resolution, starting
+whenever it was first deployed. The repo's own `data/` directory ships inside the
+deploy (Railway builds from GitHub) and holds the old hourly Actions archive
+going back to 2026-08-06.
+
+`/series` used to merge the two in time order. **Do not do that.** Each source is
+delta-encoded *against itself*, so a sparse hourly row can restate a value the
+5-minute record has already moved past. Sorted into one series that appears as a
+price moving away and back — a quote change that never happened. Anything
+counting quote moves reads those as real, which quietly corrupts exactly the
+measurement top-of-book history is for.
+
+So: wherever the volume covers a day it wins the day outright, and the repo is
+read only for days before the worker existed. That keeps the history and drops
+the phantom moves. `?src=both` restores the merge, which is what you want for the
+single partial day the worker first ran and the repo still holds the earlier
+hours. The response says which sources it actually read.
 
 `/tape` is the one to reach for. It aggregates on the server, so drawing a
 volume-by-price histogram costs one small JSON response instead of pulling
@@ -251,7 +273,16 @@ self-describing.
 node tools/series.mjs 28699                                # change rows only
 node tools/series.mjs 28699 2026-09-01 2026-09-14 --fill   # one row per sample
 node tools/validate-tape.mjs 2026-09-22                    # is the tape honest?
+
+COLLECTOR_URL=https://<app>.up.railway.app npm run archive  # pull tier 1 into this repo
 ```
+
+`archive` is what the GitHub Action runs. It makes no ESI requests: it reads
+`/raw?set=tob&day=` off the worker and writes the day files into `data/`. Days
+already committed at the same size are skipped, so re-running is cheap, and a day
+the worker has since gzipped is re-fetched in its new form with the stale plain
+`.csv` removed (the reader prefers `.csv`, so leaving one behind would shadow the
+fresher `.gz` for good).
 
 ## Tests
 
@@ -259,8 +290,7 @@ node tools/validate-tape.mjs 2026-09-22                    # is the tape honest?
 npm test
 ```
 
-130 checks across six suites (9 + 13 + 31 + 18 + 37 + 22), all against a fake
-in-process ESI — no network.
+167 checks across seven suites, all against a fake in-process ESI — no network.
 Pagination via `x-pages`, best-bid/ask reduction, the Jita filter, ladder merging
 and the level cap, delta encoding, retention and gzip, and the full fill-inference
 table including a reconstruction of a real 868-unit sweep.

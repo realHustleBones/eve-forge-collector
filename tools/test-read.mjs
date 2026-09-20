@@ -156,33 +156,61 @@ try {
   check('...and the latest one when asked past the end', r.body.ladder.t, '2026-09-15T10:30:00.000Z');
 
   // ---- /series
-  // Three rows, not two: 09:00 exists only in the repo source, 10:00 in both
-  // (deduped), 11:00 only on the volume. That interleaving IS the feature.
+  // Two rows, not three. Both sources hold this day, so the volume wins it
+  // outright and the repo's 09:00 row is not interleaved in. Each source is
+  // delta-encoded against ITSELF, so a sparse hourly row can restate a value
+  // the 5-minute record has already moved past; merged, that reads downstream
+  // as a quote move that never happened.
   r = await s.get(`/series?type=15614&from=${DAY}&to=${DAY}`);
-  check('/series merges both sources for a day they share', r.body.n, 3);
-  check('...in time order regardless of which source held which row',
+  check('/series prefers the volume outright for a day both sources hold', r.body.n, 2);
+  check('...so the sparser row from the other source is not interleaved in',
     r.body.series.map((x) => [x.t.slice(11, 16), x.buy]),
-    [['09:00', 141000], ['10:00', 141900], ['11:00', 141800]]);
+    [['10:00', 141900], ['11:00', 141800]]);
+  check('...and it reports only the source it actually read', r.body.sources, ['volume']);
   check('...carrying prices through as numbers', r.body.series.at(-1), { t: '2026-09-15T11:00:00.000Z', buy: 141800, sell: 159800 });
   r = await s.get(`/series?type=28699&from=${DAY}&to=${DAY}`);
   check('...and an empty side reads as null, not zero', r.body.series[0].sell, null);
 
-  // the merge: repo-only history, and a day both sources hold
-  r = await s.get('/series?type=15614&from=2026-08-01&to=2026-09-15');
-  check('/series reaches back into repo-only history',
-    r.body.series[0], { t: '2026-08-06T02:48:38.178Z', buy: 130000, sell: 150000 });
-  check('...merging both sources in time order',
-    r.body.series.map((x) => x.t),
-    ['2026-08-06T02:48:38.178Z', '2026-09-15T09:00:00.000Z',
-     '2026-09-15T10:00:00.000Z', '2026-09-15T11:00:00.000Z']);
+  // ?src=both restores the old merge, which is what you want on the single
+  // partial day the worker first ran and the repo still holds the earlier hours.
+  r = await s.get(`/series?type=15614&from=${DAY}&to=${DAY}&src=both`);
+  check('?src=both merges both sources for a day they share', r.body.n, 3);
+  check('...in time order regardless of which source held which row',
+    r.body.series.map((x) => [x.t.slice(11, 16), x.buy]),
+    [['09:00', 141000], ['10:00', 141900], ['11:00', 141800]]);
   check('...with the duplicated instant emitted once, not twice',
     r.body.series.filter((x) => x.t === '2026-09-15T10:00:00.000Z').length, 1);
   check('...and reporting both sources were used', r.body.sources.sort(), ['repo', 'volume']);
+
+  // Falling back is not the same as merging: a day the volume never covered
+  // still has to come through, or every day before the worker existed vanishes.
+  r = await s.get('/series?type=15614&from=2026-08-01&to=2026-09-15');
+  check('/series still falls back to repo-only history', r.body.series[0],
+    { t: '2026-08-06T02:48:38.178Z', buy: 130000, sell: 150000 });
+  check('...taking the repo day whole and the shared day from the volume',
+    r.body.series.map((x) => x.t),
+    ['2026-08-06T02:48:38.178Z', '2026-09-15T10:00:00.000Z', '2026-09-15T11:00:00.000Z']);
+  check('...and naming both sources, because both were read', r.body.sources.sort(), ['repo', 'volume']);
 
   // ---- /raw
   const raw = await fetch(`http://127.0.0.1:${s.port}/raw?set=fills&day=${DAY}`);
   check('/raw streams the day file as a download',
     [raw.status, raw.headers.get('content-disposition').includes(`fills-${DAY}`)], [200, true]);
+
+  // tob is the set an archiver pulls. It is CSV, it is nested under YYYY-MM,
+  // and it must come from the VOLUME — serving the repo's own copy back would
+  // make the archive a no-op that quietly preserves whatever is already there.
+  const rawTob = await fetch(`http://127.0.0.1:${s.port}/raw?set=tob&day=${DAY}`);
+  const tobBody = await rawTob.text();
+  check('/raw?set=tob streams the top-of-book day file',
+    [rawTob.status, rawTob.headers.get('content-disposition').includes(`tob-${DAY}.csv`)], [200, true]);
+  check('...as CSV, not ndjson', rawTob.headers.get('content-type'), 'text/csv');
+  check('...from the volume, not the repo archive',
+    [tobBody.includes('11:00:00.000Z,15614,141800'), tobBody.includes('09:00:00.000Z')], [true, false]);
+  const rawBad = await fetch(`http://127.0.0.1:${s.port}/raw?set=nope&day=${DAY}`);
+  check('...and an unknown set is a 400', rawBad.status, 400);
+  const rawGone = await fetch(`http://127.0.0.1:${s.port}/raw?set=tob&day=2019-01-01`);
+  check('...and a day with no file is a 404', rawGone.status, 404);
 
   // ---- routing
   r = await s.get('/status');

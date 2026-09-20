@@ -1,15 +1,31 @@
 name: collect
 
+# This job used to scan ESI itself, once an hour. It no longer does, for two
+# reasons:
+#
+#   1. It was not actually running hourly. GitHub throttles scheduled workflows
+#      hard, and this one was landing 5 to 7 times a day with 3 to 9 hour holes.
+#      As a backup that is a record of the book at breakfast and dinner.
+#   2. It was redundant. The Railway worker writes top of book for EVERY Forge
+#      item on every 5-minute tick — topOfBook() has no universe filter, unlike
+#      laddersFrom() — so the worker's archive is a strict superset of what this
+#      job produced, at roughly 58x the sample rate and no extra ESI requests.
+#
+# So the job's role is now ARCHIVING, not collecting: it pulls the worker's
+# top-of-book day files and commits them, which is what keeps the Railway volume
+# from being the only live copy. It makes zero ESI requests.
+#
+# Required repo variable: COLLECTOR_URL (Settings -> Secrets and variables ->
+# Actions -> Variables), e.g. https://your-app.up.railway.app
+# Optional repo secret:   READ_TOKEN, if the worker sets one.
+
 on:
   schedule:
-    # Every hour at :48. Deliberately off the hour — GitHub's scheduler is
-    # busiest at :00 and drifts most there. Expect samples to land a few
-    # minutes late under load; this is best-effort, not a real-time cron.
-    - cron: '5 * * * *'
+    # Once a day is enough now. The worker is the live collector; this is a
+    # copy. Being throttled by an hour or two costs nothing.
+    - cron: '40 6 * * *'
   workflow_dispatch: {}
 
-# Never let a slow run overlap the next one — two collectors appending to the
-# same day file would interleave rows and corrupt the delta state.
 concurrency:
   group: collect
   cancel-in-progress: false
@@ -18,7 +34,7 @@ permissions:
   contents: write
 
 jobs:
-  collect:
+  archive:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -28,12 +44,15 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Collect Forge bid/ask
+      - name: Archive the worker's top-of-book
         env:
-          # ESI asks for a contact in the User-Agent. Set the ESI_UA repo
-          # variable (Settings -> Secrets and variables -> Actions -> Variables).
-          ESI_UA: ${{ vars.ESI_UA || 'eve-forge-collector (github actions)' }}
-        run: node collect.mjs
+          COLLECTOR_URL: ${{ vars.COLLECTOR_URL }}
+          READ_TOKEN: ${{ secrets.READ_TOKEN }}
+          # Re-fetch a week each run: closed days are size-compared and skipped,
+          # so the only real cost is the open day plus any the worker has since
+          # gzipped. It also self-heals a run that was throttled away.
+          DAYS: '7'
+        run: node tools/archive-tob.mjs
 
       - name: Commit
         run: |
@@ -45,8 +64,7 @@ jobs:
             echo "no changes"
             exit 0
           fi
-          git commit -m "data: $(date -u +%Y-%m-%dT%H:%MZ)"
-          # Another run may have landed while we were scanning; rebase and retry.
+          git commit -m "archive: $(date -u +%Y-%m-%dT%H:%MZ)"
           for i in 1 2 3; do
             if git push; then exit 0; fi
             git pull --rebase --autostash
